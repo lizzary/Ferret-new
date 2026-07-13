@@ -1,0 +1,59 @@
+# Every key can be overridden with an INDEXNODE_ environment variable. Dots in
+# the YAML path become underscores, for example INDEXNODE_WATCH_BUFFER_SIZE.
+node_id: ""                     # Empty: persist a generated UUID in data_dir/node_id.
+data_dir: /var/lib/indexnode    # SQLite, Tantivy, vector snapshots, and logs.
+grpc_listen: 0.0.0.0:7701
+metrics_listen: 127.0.0.1:7702
+
+watch:
+  roots:
+    - path: /home/user/docs
+      recursive: true
+  buffer_size: 4096
+  settle_window: 1s
+
+compute:
+  endpoint: dns:///compute:7801 # Use localhost or in-process wiring for standalone mode.
+  batch_size: 32
+  batch_linger: 100ms
+  inflight_batches: 8
+  breaker:
+    failures: 5
+    open_for: 30s
+
+pipeline:
+  io_concurrency: 0             # 0 = automatic min(4*CPU, 32).
+  io_bytes_inflight: 268435456
+  cpu_percent_cap: 50
+  max_file_size: 536870912
+  max_extract_bytes: 2097152
+  video_frames: 5
+  ffmpeg_path: ffmpeg
+
+index:
+  commit_max_ops: 1000
+  commit_interval: 3s
+  vector:
+    m: 16
+    ef_construction: 200
+    ef_search: 64
+    snapshot_interval: 10m
+
+retry:
+  base: 5s
+  cap: 30m
+  max_attempts_transient: 8
+  retry_budget_ratio: 0.2
+
+dead_letter:
+  retention_days: 90
+reconcile:
+  periodic: 24h
+notes:
+  on_file_delete: orphan
+resources:
+  min_free_bytes: 2147483648
+log:
+  level: info
+  redact_paths: false
+  retain_days: 7

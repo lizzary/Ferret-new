@@ -1,0 +1,4 @@
+ALTER TABLE files ADD COLUMN path_key TEXT;
+
+ALTER TABLE tasks ADD COLUMN path_key TEXT;
+ALTER TABLE tasks ADD COLUMN old_path_key TEXT;

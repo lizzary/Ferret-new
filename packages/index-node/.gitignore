@@ -1,0 +1,28 @@
+# Go build and test output
+/indexnode
+/indexnode.exe
+/bin/
+/dist/
+/coverage.out
+/store_coverage
+/*.cover
+/*.prof
+/.cache/
+/.gocache/
+/.gotmp/
+/errclass
+/scheduler
+
+# Runtime state (projections and durable local data)
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.jsonl
+vector.snapshot*
+
+# Local tooling
+/.idea/
+/.vscode/
+*.tmp

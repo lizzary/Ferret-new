@@ -1,0 +1,150 @@
+# Index-node progress
+
+Last updated: 2026-07-13
+
+## M0 - skeleton (complete)
+
+### Completed
+
+- Established the Go 1.26 module, command entry point, lifecycle boundary, Makefile, example configuration, and project documentation.
+- Added strict YAML configuration with defaults, field-qualified validation, complete `INDEXNODE_` environment overrides, and stable UUID persistence in `data_dir/node_id`.
+- Added the SQLite WAL store with numbered embedded migrations, an independent read pool, one serialized writer, `WithTx`, FULL-sync note writes, the complete catalog/task/note/dead-letter/vector schema, and explicit task state transitions.
+- Added atomic task claiming, generation fences, clean-shutdown/crash recovery, recovery collision handling, second-crash poison detection, and dead-letter anchoring.
+- Added JSON logging, local rotation, boundary path redaction (including nested containers and free-form messages), task/trace context fields, the full Prometheus metric inventory, a metrics HTTP endpoint, and durable JSONL auditing.
+- Wired lifecycle startup through store recovery and metrics serving, followed by reverse-order shutdown and the final `clean_shutdown=true` mutation.
+
+### Validation
+
+- `go test -count=1 ./...` passes.
+- `go test -race -count=1 ./...` passes.
+- `go vet ./...` passes.
+- `go build -buildvcs=false ./cmd/indexnode` passes.
+- `internal/store` statement coverage is 81.2%, satisfying the §11 package threshold.
+- The host does not have `make`; the Go commands behind `make test race` were run directly.
+
+### Known issues
+
+- The process intentionally remains `warming`; indexing and RPC serving begin in M1 and later milestones.
+- The workspace contains an empty/non-functional parent `.git` directory, so local builds use `-buildvcs=false`.
+- Protobuf contracts, Tantivy, vector indexing, watcher, pipeline, reconciliation, and RPC components are not part of M0.
+
+## M1 - text indexing path (complete)
+
+### Completed
+
+- Added explicit transient/permanent/poison/fatal error classification, jittered exponential retry policy, and package coverage of 97.2%.
+- Added the single-owner durable scheduler with bounded dispatch, path/prefix conflict serialization, retry wakeups, dispatch-attempt refunds, and package coverage of 91.7%.
+- Added the IO stage with double-stat settling, bounded task/byte semaphores, inclusive 128 KiB imohash behavior, idempotent tuple/hash fast paths, and relocate detection.
+- Added the extractor registry, binary sniffing, UTF-8 BOM/GBK/GB18030 plaintext decoding, UTF-8-safe 2 MiB truncation, and panic isolation.
+- Added the real tantivy-go adapter, stored file documents, Jieba mixed Chinese/Latin tokenization, delete+add mutation batches, a bounded single commit writer, generation fencing, and atomic SQLite batch receipts.
+- Wired Store -> Tantivy -> writer -> worker pool -> scheduler -> metrics with ordered startup and scheduler/worker/writer drain on shutdown. The clean marker is written only after every durable component exits successfully.
+- Added temporary `enqueue` and JSON `search` commands while keeping the original no-subcommand run command compatible.
+- Added a 1000-file end-to-end acceptance test, idempotent repeat assertion, process re-exec/forced-termination recovery test, and a true durable `BenchmarkTextPipeline` (including SQLite, scheduler, extraction, Tantivy, and receipt commit).
+- Recorded the CJK tokenizer and tantivy-go numeric-field constraints in ADR 0001 and ADR 0002.
+
+### Validation
+
+- `go test -count=1 ./...` passes, including 1000/1000 keyword hits and forced-process-termination recovery.
+- `go test -race -count=1 ./...` passes.
+- `go vet ./...` passes.
+- `go build -buildvcs=false ./cmd/indexnode` passes.
+- Coverage thresholds pass: `internal/store` 80.5%, `internal/errclass` 97.2%, `internal/scheduler` 91.7%.
+- `BenchmarkTextPipeline` reports `files/s` for the complete durable text path.
+
+### Known issues
+
+- The temporary manual enqueue command remains available for diagnostics; normal ingestion now uses M2 watch roots.
+- tantivy-go v1.0.6 exposes text fields only, so numeric metadata is stored as raw decimal text and catalog-side filtering remains authoritative until the binding gains numeric fields (ADR 0002).
+- The temporary enqueue command is intended for a stopped node; M8 replaces it with the process control plane.
+
+## M2 - filesystem event ingestion (complete)
+
+### Completed
+
+- Pinned and inspected `github.com/lizzary/filecat-go v1.0.0`; all third-party watcher types remain isolated in `internal/watch/filecat.go`.
+- Added one managed consumer per watch root, bounded nonblocking delivery, dirty generations, root health, failure isolation, 5s-to-5m reopen backoff, dynamic add/remove, and deterministic watcher shutdown.
+- Added the single-owner debounce map/min-heap state machine with the complete merge table, move-chain folding, resettable settle deadlines, bounded admission, cancellation drain/flush, and a synchronous prefix fence for root removal.
+- Added the initial-root dirty hint, fixed source-path reuse (`Move(A->B), Created(A), Removed(B)`), and prevented a single event from incorrectly resetting a flapping watcher's reopen backoff. Ordinary directory entries stay incremental through filecat descendant events instead of forcing root scans.
+- Added atomic directory remove/relocate expansion. Catalog generation bumps, per-child task creation/coalescing, and parent completion share one SQLite transaction; relocation preserves stable `file_id` and relative suffixes. Dynamic root removal synchronously fences debounce then creates all prefix removals.
+- Wired `writer -> processor -> scheduler -> debounce -> watch -> metrics` startup and strict reverse shutdown. `/healthz` aggregates active/pending/degraded/dirty root counts without exposing paths.
+- Added a real filecat acceptance test covering write storms, file moves, directory moves, file/directory deletion, final on-disk Tantivy search, and metric assertions proving both move paths perform zero additional extraction.
+- Recorded the all-or-nothing large-directory transaction decision in ADR 0003.
+
+### Validation
+
+- `go test -count=1 ./...` passes.
+- `go test -race -count=1 ./...` passes.
+- `go vet ./...` passes.
+- `go build -buildvcs=false ./cmd/indexnode` passes.
+- Required coverage thresholds pass: `internal/store` 81.1%, `internal/debounce` 91.6%, `internal/errclass` 97.2%, and `internal/scheduler` 91.7%.
+- The real watcher test converges create/write/move/delete operations and observes two move fast paths with no extraction-count increase.
+
+### Known issues
+
+- Dirty-root and newly-added-root hints are retained in watcher state, but their actual filesystem scan is M3's responsibility.
+- Kernel overflow and downstream debounce backpressure currently share the dirty-root path; M9 adds separately attributed metrics.
+- The current ADR-approved directory expansion uses one transaction and an in-memory catalog slice even above 100,000 children; stress results may justify a durable-cursor design later.
+
+## M3 - authoritative reconciliation (complete)
+
+### Completed
+
+- Added startup, coalesced dirty-root, and configurable periodic reconciliation. Startup remains `warming` until every readable root epoch completes; watcher overflow, downstream admission loss, and watcher failure/reopen are the only automatic event-path promotions to a full scan.
+- Kept ordinary directory create/modify/move/remove incremental. filecat descendant events feed normal tasks, while directory move/remove uses the atomic catalog-prefix expansion from M2; successful directory processing no longer forces a whole-root walk.
+- Added authoritative root identity checks before and after each round, symlink/reparse avoidance, unavailable-root mass-delete protection, keyset-paged catalog reconciliation, nested-work collapsing, root epochs, cancellation fences, and bounded tombstone cleanup for dynamic root churn.
+- Added at most four concurrent root rounds and a bounded four-worker stat pool inside each root walk. Stat results feed one serial visitor, queues are bounded by the worker limit, and cancellation/error paths join every scoped goroutine.
+- Added transactional conditional scanner enqueue. Catalog identity/generation validation, active-work coverage, generation allocation, and task insertion are one SQLite mutation boundary; unique `(size, mtime_ns, inode)` identity recognizes missed rename events without changing `file_id`.
+- Closed the scanner/watcher in-flight race: direct-path in-flight work is covered rather than duplicated, followed by an authoritative per-root rescan with exponential `RetryBase -> RetryCap` backoff. A change observed after the worker started therefore becomes `generation+1` only after the covering task exits.
+- Added Windows-stable file IDs through handle metadata and case-insensitive `path_key` columns for catalog/tasks while preserving display casing. Migration backfill detects case-fold collisions and refuses unsafe startup instead of merging data.
+- Strengthened lifecycle ownership: root removal fences scanner/debounce before optional prefix removal, shutdown joins admitted removal hooks, and a shutdown timeout never closes native projection/store resources underneath a live component.
+- Added restart convergence, unavailable/swapped-root safety, dropped-event dirty convergence, pagination, case-only rename, missed-relocate, in-flight deferred-rescan, 64-epoch churn, real watcher directory move, and concurrent stat-pool regressions. Directory/file moves preserve `file_id`, leave no obsolete path row, and add zero extraction work.
+
+### Validation
+
+- `go test -buildvcs=false -count=1 ./...` passes.
+- `go test -buildvcs=false -race -count=1 ./...` passes.
+- `go vet ./...` passes.
+- `go build -buildvcs=false ./cmd/indexnode` passes.
+- Required coverage thresholds pass: `internal/store` 81.2%, `internal/debounce` 90.6%, `internal/errclass` 97.2%, and `internal/scheduler` 91.7%; `internal/reconcile` is 81.7%.
+- The real watcher test observes both move fast paths (`move_fast_path=2`) with exactly the three initial extractions (`extract=3`), including stable directory-child identity.
+
+### Known issues
+
+- A deliberate full scan remains O(files + catalog rows). It uses bounded concurrency and metadata only, but very large cold roots still consume filesystem metadata bandwidth while warming.
+- The required `-tags stress` 50,000-file/write-storm memory test and separately attributed watcher-loss metrics remain scheduled for M9.
+- Explicit `TriggerRescan` and dynamic administration over gRPC arrive with the M8 control plane.
+
+## M4 - reliability and dead-letter recovery (complete)
+
+### Completed
+
+- Completed the eight-attempt transient retry path with persisted failure histories, jittered backoff, claim-attempt accounting, and a work-conserving scheduler split that limits retries to 20% of dispatches while fresh work exists.
+- Added the dependency circuit breaker with closed/open/half-open states, one-probe recovery, probe-dispatch watchdog, and `waiting_dep` parking. Compute outages refund the lease charge, never increase task attempts, and automatically resume parked work after recovery.
+- Completed poison handling for extractor panics and unclean restarts. In-flight tasks persist runtime extractor/embed versions, increment `crash_count` on recovery, requeue after the first crash, and become poison dead letters after the second.
+- Made terminal failure transactional across task, catalog, dead-letter, and audit-outbox state. Failed catalog rows remain filename/path searchable through the bounded Tantivy commit writer while stale content from an older successful generation is removed.
+- Added manual dead-letter listing/redrive by explicit file IDs or error class, startup redrive for extractor/embed version mismatches, relocate-safe paths, and generation fences so a newer filesystem change always supersedes an older failure or redrive.
+- Added the durable ordered SQLite audit outbox for dead-letter creation, redrive, and crash poison events. Delivery appends and fsyncs JSONL before acknowledgement; startup/shutdown replay is at least once and retains unacknowledged rows across audit failures.
+- Added 90-day dead-letter retention with archive-audit-before-conditional-delete semantics, dead-letter metrics, and startup repair of any missing failed-file projections.
+- Added exclusive OS data-directory ownership for the node and every temporary one-shot SQLite/Tantivy command. Maintenance commands preserve the prior crash marker, leaving full recovery, poison projection, and audit replay to the next complete node startup.
+- Added acceptance and regression coverage for panic poison, repeated compute outages with zero attempt growth and automatic recovery, real redrive through audit and Tantivy search, crash/version-triggered redrive, retention, audit replay/duplication windows, filename-only failed projections, relocate and higher-generation races, and active-node command rejection.
+- Recorded the retry scheduling contract in ADR 0004 and the audit-outbox/instance-ownership contract in ADR 0005.
+
+### Validation
+
+- `go test -buildvcs=false -count=1 ./...` passes across all 19 packages.
+- `go test -buildvcs=false -race -count=1 ./...` passes with no data races.
+- `go vet -buildvcs=false ./...` passes.
+- `go build -buildvcs=false ./cmd/indexnode` passes.
+- Required coverage thresholds pass: `internal/store` 80.3%, `internal/debounce` 90.6%, `internal/errclass` 97.2%, and `internal/scheduler` 90.8%.
+- Final P0-P2 review is clear, and every repository Go source file passes `gofmt -l`.
+
+### Known issues
+
+- M4's dependency controller is transport-agnostic; the real embed client, micro-batching, vector persistence, HNSW recovery, and semantic/hybrid search arrive in M5.
+- Audit outbox delivery is intentionally at least once. A crash after JSONL fsync but before SQLite acknowledgement can duplicate an event; stable ordering and correlation fields make duplicates identifiable (ADR 0005).
+- Temporary `enqueue`, `search`, and `deadletters` commands require the long-running node to be stopped. M8 replaces these owner-locked one-shot paths with the in-process gRPC control plane.
+- The workspace still has an empty/non-functional parent `.git` directory, so local validation uses `-buildvcs=false`.
+
+## Next
+
+M5: add image/media extraction, the micro-batched embed client and breaker integration, vector persistence and HNSW recovery, semantic/hybrid search, and RRF ranking.
