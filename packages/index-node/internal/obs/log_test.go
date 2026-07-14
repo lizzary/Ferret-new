@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -66,6 +67,48 @@ func TestNewJSONLoggerKeepsLocalPath(t *testing.T) {
 	}
 	if got := entry["path"]; got != rawPath {
 		t.Fatalf("path = %v, want full local path", got)
+	}
+}
+
+func TestOpenLocalLoggerMirrorsJSONAndKeepsLocalPath(t *testing.T) {
+	t.Parallel()
+
+	logPath := filepath.Join(t.TempDir(), "logs", "indexnode.log")
+	var mirror bytes.Buffer
+	logger, closer, err := OpenLocalLogger(LocalLogOptions{
+		Path:      logPath,
+		LogWriter: &mirror,
+	})
+	if err != nil {
+		t.Fatalf("open local logger: %v", err)
+	}
+	rawPath := `/home/alice/private/report.txt`
+	logger.Info("local mirror", slog.String("path", rawPath), slog.Int("generation", 4))
+	if err := closer.Close(); err != nil {
+		t.Fatalf("close local logger: %v", err)
+	}
+
+	primary, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read primary log: %v", err)
+	}
+	if !bytes.Equal(primary, mirror.Bytes()) {
+		t.Fatalf("mirror did not receive the primary JSON record\nprimary: %s\nmirror: %s", primary, mirror.Bytes())
+	}
+	for name, data := range map[string][]byte{"primary": primary, "mirror": mirror.Bytes()} {
+		var entry map[string]any
+		if err := json.Unmarshal(data, &entry); err != nil {
+			t.Fatalf("decode %s log JSON: %v", name, err)
+		}
+		if got := entry["msg"]; got != "local mirror" {
+			t.Fatalf("%s msg = %v, want local mirror", name, got)
+		}
+		if got := entry["path"]; got != rawPath {
+			t.Fatalf("%s path = %v, want full local path", name, got)
+		}
+		if got := entry["generation"]; got != float64(4) {
+			t.Fatalf("%s generation = %v, want 4", name, got)
+		}
 	}
 }
 

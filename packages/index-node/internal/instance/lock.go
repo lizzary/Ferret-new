@@ -1,6 +1,7 @@
-// Package instance owns the cross-process data-directory lock. Every process
-// that may mutate the durable store must hold this lock before Store.Open so a
-// live node can never be mistaken for a crashed one by a one-shot command.
+// Package instance owns the cross-process data-directory lock. Every lifecycle
+// or stopped-node maintenance operation that may mutate the durable store must
+// hold this lock before Store.Open, so maintenance cannot race a live node or
+// accidentally trigger its crash recovery.
 package instance
 
 import (

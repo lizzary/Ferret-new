@@ -29,9 +29,21 @@ const (
 	// INDEXNODE_WATCH_BUFFER_SIZE.
 	EnvironmentPrefix = "INDEXNODE_"
 
+	// ConfigEnvironmentVariable selects the YAML file loaded by the process.
+	// It is launcher metadata rather than a Config field, so applyEnvironment
+	// permits it without attempting to decode it into Config.
+	ConfigEnvironmentVariable = "INDEXNODE_CONFIG"
+
 	// NodeIDFilename is the file used when node_id is not explicitly configured.
 	NodeIDFilename = "node_id"
 )
+
+// PathFromEnvironment returns the YAML path selected by
+// INDEXNODE_CONFIG. Surrounding whitespace is ignored so an empty or
+// whitespace-only value consistently means that no YAML file was selected.
+func PathFromEnvironment() string {
+	return strings.TrimSpace(os.Getenv(ConfigEnvironmentVariable))
+}
 
 // Config is the complete index-node configuration described in section 9 of
 // the development specification.
@@ -188,9 +200,14 @@ func Default() Config {
 
 // Load overlays a strict YAML file and INDEXNODE_ environment variables on
 // Default, validates the result, and resolves an empty node_id to the stable ID
-// stored in <data_dir>/node_id. An empty path means defaults plus environment.
+// stored in <data_dir>/node_id. A non-empty path takes precedence over
+// INDEXNODE_CONFIG; an empty path selects its trimmed value, or defaults plus
+// field environment variables when INDEXNODE_CONFIG is also empty.
 func Load(path string) (*Config, error) {
 	cfg := Default()
+	if path == "" {
+		path = PathFromEnvironment()
+	}
 
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -393,7 +410,9 @@ func decodeOneYAML(data []byte, destination any) error {
 }
 
 func applyEnvironment(cfg *Config) error {
-	known := make(map[string]string)
+	known := map[string]string{
+		ConfigEnvironmentVariable: "<configuration path>",
+	}
 	if err := applyEnvironmentValue(reflect.ValueOf(cfg).Elem(), "", known); err != nil {
 		return err
 	}

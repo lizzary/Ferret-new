@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -38,10 +39,21 @@ const (
 
 var ErrComponentsLive = errors.New("lifecycle: components remain live after shutdown deadline")
 
+// RunOptions configures optional lifecycle integrations. LogWriter receives a
+// copy of each node-local JSON log record without replacing the rotating log.
+type RunOptions struct {
+	LogWriter io.Writer
+}
+
 // Run assembles the M1 text path and owns its strict reverse-order shutdown.
 // Store.Open changes clean_shutdown to false before any component can start;
 // the marker is restored only after every component has exited successfully.
-func Run(ctx context.Context, cfg *config.Config) (returnErr error) {
+func Run(ctx context.Context, cfg *config.Config) error {
+	return RunWithOptions(ctx, cfg, RunOptions{})
+}
+
+// RunWithOptions assembles the node lifecycle with optional integrations.
+func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions) (returnErr error) {
 	if ctx == nil {
 		return errors.New("lifecycle: context is required")
 	}
@@ -66,6 +78,7 @@ func Run(ctx context.Context, cfg *config.Config) (returnErr error) {
 	logger, logCloser, err := obs.OpenLocalLogger(obs.LocalLogOptions{
 		Path: filepath.Join(cfg.DataDir, "logs", "indexnode.log"), Level: level,
 		RetainDays: cfg.Log.RetainDays,
+		LogWriter:  options.LogWriter,
 	})
 	if err != nil {
 		return fmt.Errorf("lifecycle: open logger: %w", err)

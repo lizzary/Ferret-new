@@ -1,13 +1,13 @@
 # Index-node progress
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## M0 - skeleton (complete)
 
 ### Completed
 
 - Established the Go 1.26 module, command entry point, lifecycle boundary, Makefile, example configuration, and project documentation.
-- Added strict YAML configuration with defaults, field-qualified validation, complete `INDEXNODE_` environment overrides, and stable UUID persistence in `data_dir/node_id`.
+- Added strict YAML configuration with defaults, field-qualified validation, complete `INDEXNODE_` field environment overrides, and stable UUID persistence in `data_dir/node_id`.
 - Added the SQLite WAL store with numbered embedded migrations, an independent read pool, one serialized writer, `WithTx`, FULL-sync note writes, the complete catalog/task/note/dead-letter/vector schema, and explicit task state transitions.
 - Added atomic task claiming, generation fences, clean-shutdown/crash recovery, recovery collision handling, second-crash poison detection, and dead-letter anchoring.
 - Added JSON logging, local rotation, boundary path redaction (including nested containers and free-form messages), task/trace context fields, the full Prometheus metric inventory, a metrics HTTP endpoint, and durable JSONL auditing.
@@ -38,7 +38,7 @@ Last updated: 2026-07-13
 - Added the extractor registry, binary sniffing, UTF-8 BOM/GBK/GB18030 plaintext decoding, UTF-8-safe 2 MiB truncation, and panic isolation.
 - Added the real tantivy-go adapter, stored file documents, Jieba mixed Chinese/Latin tokenization, delete+add mutation batches, a bounded single commit writer, generation fencing, and atomic SQLite batch receipts.
 - Wired Store -> Tantivy -> writer -> worker pool -> scheduler -> metrics with ordered startup and scheduler/worker/writer drain on shutdown. The clean marker is written only after every durable component exits successfully.
-- Added temporary `enqueue` and JSON `search` commands while keeping the original no-subcommand run command compatible.
+- Added temporary executable `enqueue` and JSON `search` commands for the M1 bring-up; those compatibility forms were removed when the M0-M4 command surface was consolidated into Bubble Tea.
 - Added a 1000-file end-to-end acceptance test, idempotent repeat assertion, process re-exec/forced-termination recovery test, and a true durable `BenchmarkTextPipeline` (including SQLite, scheduler, extraction, Tantivy, and receipt commit).
 - Recorded the CJK tokenizer and tantivy-go numeric-field constraints in ADR 0001 and ADR 0002.
 
@@ -53,9 +53,9 @@ Last updated: 2026-07-13
 
 ### Known issues
 
-- The temporary manual enqueue command remains available for diagnostics; normal ingestion now uses M2 watch roots.
+- The former executable manual-enqueue path is now available only as the stopped-node Bubble Tea `/enqueue` command; normal ingestion uses M2 watch roots.
 - tantivy-go v1.0.6 exposes text fields only, so numeric metadata is stored as raw decimal text and catalog-side filtering remains authoritative until the binding gains numeric fields (ADR 0002).
-- The temporary enqueue command is intended for a stopped node; M8 replaces it with the process control plane.
+- `/enqueue` requires a stopped node; M8 replaces this owner-locked maintenance boundary with the process control plane.
 
 ## M2 - filesystem event ingestion (complete)
 
@@ -125,7 +125,7 @@ Last updated: 2026-07-13
 - Added manual dead-letter listing/redrive by explicit file IDs or error class, startup redrive for extractor/embed version mismatches, relocate-safe paths, and generation fences so a newer filesystem change always supersedes an older failure or redrive.
 - Added the durable ordered SQLite audit outbox for dead-letter creation, redrive, and crash poison events. Delivery appends and fsyncs JSONL before acknowledgement; startup/shutdown replay is at least once and retains unacknowledged rows across audit failures.
 - Added 90-day dead-letter retention with archive-audit-before-conditional-delete semantics, dead-letter metrics, and startup repair of any missing failed-file projections.
-- Added exclusive OS data-directory ownership for the node and every temporary one-shot SQLite/Tantivy command. Maintenance commands preserve the prior crash marker, leaving full recovery, poison projection, and audit replay to the next complete node startup.
+- Added exclusive OS data-directory ownership for the node and every stopped-node SQLite/Tantivy maintenance operation. Maintenance preserves the prior crash marker, leaving full recovery, poison projection, and audit replay to the next complete node startup.
 - Added acceptance and regression coverage for panic poison, repeated compute outages with zero attempt growth and automatic recovery, real redrive through audit and Tantivy search, crash/version-triggered redrive, retention, audit replay/duplication windows, filename-only failed projections, relocate and higher-generation races, and active-node command rejection.
 - Recorded the retry scheduling contract in ADR 0004 and the audit-outbox/instance-ownership contract in ADR 0005.
 
@@ -142,8 +142,33 @@ Last updated: 2026-07-13
 
 - M4's dependency controller is transport-agnostic; the real embed client, micro-batching, vector persistence, HNSW recovery, and semantic/hybrid search arrive in M5.
 - Audit outbox delivery is intentionally at least once. A crash after JSONL fsync but before SQLite acknowledgement can duplicate an event; stable ordering and correlation fields make duplicates identifiable (ADR 0005).
-- Temporary `enqueue`, `search`, and `deadletters` commands require the long-running node to be stopped. M8 replaces these owner-locked one-shot paths with the in-process gRPC control plane.
+- Bubble Tea `/enqueue`, `/search`, and `/deadletters` require the lifecycle to be stopped. M8 replaces these owner-locked maintenance paths with the in-process gRPC control plane.
 - The workspace still has an empty/non-functional parent `.git` directory, so local validation uses `-buildvcs=false`.
+
+## Bubble Tea terminal shell - M0-M4 surface
+
+### Completed
+
+- Made the Bubble Tea v2 dashboard the default interactive frontend when stdin and stdout are TTYs. Redirected and other non-TTY execution automatically uses the plain lifecycle, while `-no-ui` is the sole application option for forcing that fallback in a capable terminal.
+- Reduced `cmd/indexnode` to a thin composition root for configuration loading and frontend selection; it no longer owns positional command routing, maintenance formatting, or backend JSON adapters.
+- Reused Artifex's production Frame Crab ANSI mascot, responsive panel geometry, dark/light palette, prompt, command suggestions, and full-screen log controls without substituting Bubbles widgets.
+- Bridged the rotating local JSON logger to a bounded in-memory TUI log hub without redirecting lifecycle logs through stdout or changing local path-retention semantics.
+- Connected lifecycle start, strict stop, restart, health polling, resolved configuration display/load/reload, persisted terminal theme, and clean `/quit`/`Ctrl+C` shutdown. `INDEXNODE_CONFIG` selects the first-launch/headless startup YAML; while stopped, `/config load <path>` atomically selects a new session source and `/config reload` rereads the current source. Failure preserves both the prior resolved configuration and source, and the TUI never rewrites YAML.
+- Exposed enqueue, keyword-search, and dead-letter maintenance only as stopped-node slash commands. Removed their executable JSON compatibility forms instead of maintaining a second command parser and output contract.
+- Preflights Tantivy before Bubble Tea owns the terminal so the v1.0.6 binding's one-time stdout debug line cannot corrupt renderer coordinates; prompt input now uses Bubble Tea's real cursor with width-bounded home/log rows.
+- Kept later capabilities explicitly staged: live maintenance/dynamic administration and rescan/reindex remain M8 work; semantic/media, video, notes, and complete observability remain attached to their original milestones.
+
+### Boundary
+
+- `<data_dir>/cli.json` stores terminal appearance selected by `/theme auto|dark|light` only. Node YAML remains strict and is never rewritten by the TUI; `/config` displays resolved settings/source, `/config load <path>` changes the current session source while stopped (quoted paths support spaces), and `/config reload` rereads that source.
+- The executable accepts only `-no-ui` (`-h`/`-help` are supplied by Go's flag package). Positional subcommands and the former configuration/theme flags are intentionally unsupported.
+- Until M8 exposes an in-process control service, `/enqueue`, `/search`, and `/deadletters` require `/stop`; the UI reports this instead of bypassing the data-directory owner lock.
+
+### Validation
+
+- `go test -buildvcs=false -count=1 ./...`
+- `go test -buildvcs=false -race -count=1 ./...`, followed by a final targeted race run for `./internal/cli ./cmd/indexnode`
+- `go vet -buildvcs=false ./...`, `go mod tidy -diff`, and a clean `go build -buildvcs=false ./cmd/indexnode`
 
 ## Next
 

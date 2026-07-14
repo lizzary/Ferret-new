@@ -37,6 +37,8 @@ type LocalLogOptions struct {
 	Level      slog.Leveler
 	AddSource  bool
 	AlsoStderr bool
+	// LogWriter receives the same local JSON records as the rotating log.
+	LogWriter  io.Writer
 	RetainDays int
 	MaxSizeMB  int
 	MaxBackups int
@@ -138,8 +140,15 @@ func OpenLocalLogger(options LocalLogOptions) (*slog.Logger, io.Closer, error) {
 	}
 
 	var writer io.Writer = roller
+	writers := []io.Writer{writer}
 	if options.AlsoStderr {
-		writer = io.MultiWriter(roller, os.Stderr)
+		writers = append(writers, os.Stderr)
+	}
+	if options.LogWriter != nil {
+		writers = append(writers, options.LogWriter)
+	}
+	if len(writers) > 1 {
+		writer = io.MultiWriter(writers...)
 	}
 
 	logger := NewJSONLogger(writer, LoggerOptions{

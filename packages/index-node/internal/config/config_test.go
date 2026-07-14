@@ -136,6 +136,84 @@ log:
 	}
 }
 
+func TestPathFromEnvironmentSelectsYAMLAndAllowsFieldOverrides(t *testing.T) {
+	dataDir := t.TempDir()
+	configPath := writeConfig(t, fmt.Sprintf(`
+node_id: environment-selected
+data_dir: %q
+compute:
+  batch_size: 17
+log:
+  level: debug
+`, filepath.ToSlash(dataDir)))
+
+	t.Setenv(ConfigEnvironmentVariable, " \t"+configPath+" \r\n")
+	t.Setenv("INDEXNODE_LOG_LEVEL", "warn")
+
+	selectedPath := PathFromEnvironment()
+	if selectedPath != configPath {
+		t.Fatalf("PathFromEnvironment() = %q, want %q", selectedPath, configPath)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") = %v", err)
+	}
+	if cfg.NodeID != "environment-selected" || cfg.Compute.BatchSize != 17 {
+		t.Errorf("YAML values not loaded: NodeID=%q Compute.BatchSize=%d", cfg.NodeID, cfg.Compute.BatchSize)
+	}
+	if cfg.Log.Level != "warn" {
+		t.Errorf("Log.Level = %q, want environment override warn", cfg.Log.Level)
+	}
+}
+
+func TestPathFromEnvironmentTreatsEmptyValuesAsUnset(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "whitespace", value: " \t\r\n"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(ConfigEnvironmentVariable, test.value)
+			if got := PathFromEnvironment(); got != "" {
+				t.Fatalf("PathFromEnvironment() = %q, want empty", got)
+			}
+		})
+	}
+}
+
+func TestLoadExplicitPathOverridesConfigEnvironment(t *testing.T) {
+	environmentPath := writeConfig(t, "node_id: from-environment\ncompute: {batch_size: 17}\n")
+	explicitPath := writeConfig(t, "node_id: from-explicit-path\ncompute: {batch_size: 23}\n")
+	t.Setenv(ConfigEnvironmentVariable, environmentPath)
+
+	cfg, err := Load(explicitPath)
+	if err != nil {
+		t.Fatalf("Load(explicitPath) = %v", err)
+	}
+	if cfg.NodeID != "from-explicit-path" || cfg.Compute.BatchSize != 23 {
+		t.Fatalf("explicit YAML not selected: NodeID=%q Compute.BatchSize=%d", cfg.NodeID, cfg.Compute.BatchSize)
+	}
+}
+
+func TestConfigEnvironmentVariableDoesNotPermitOtherUnknownVariables(t *testing.T) {
+	configPath := writeConfig(t, "node_id: environment-validation\n")
+	t.Setenv(ConfigEnvironmentVariable, configPath)
+
+	if _, err := Load(""); err != nil {
+		t.Fatalf("Load() rejected %s: %v", ConfigEnvironmentVariable, err)
+	}
+
+	t.Setenv("INDEXNODE_CONFIG_TYPO", configPath)
+	_, err := Load("")
+	if err == nil || !strings.Contains(err.Error(), "INDEXNODE_CONFIG_TYPO: unknown configuration field") {
+		t.Fatalf("Load() error = %v, want unknown INDEXNODE_CONFIG_TYPO", err)
+	}
+}
+
 func TestExampleConfigurationLoads(t *testing.T) {
 	t.Setenv("INDEXNODE_NODE_ID", "example-config-test")
 	t.Setenv("INDEXNODE_DATA_DIR", filepath.ToSlash(t.TempDir()))

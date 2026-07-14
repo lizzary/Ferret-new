@@ -21,6 +21,12 @@ import (
 
 var ErrDocumentNotFound = errors.New("index: document not found")
 
+var (
+	tantivyInitOnce sync.Once
+	tantivyInitErr  error
+	tantivyStdoutMu sync.Mutex
+)
+
 const (
 	FieldDocType    = "doc_type"
 	FieldFileID     = "file_id"
@@ -95,6 +101,41 @@ type Engine struct {
 	closeErr error
 }
 
+// InitializeTantivy initializes the process-wide native Tantivy runtime.
+// tantivy-go v1.0.6 writes a debug line directly to os.Stdout during LibInit.
+// Contain that dependency leak here, at the adapter boundary, so neither a
+// Bubble Tea renderer nor the plain lifecycle receives out-of-band output.
+func InitializeTantivy() error {
+	tantivyInitOnce.Do(func() {
+		tantivyInitErr = withSuppressedProcessStdout(func() error {
+			if err := tantivygo.LibInit(true, true, "off"); err != nil {
+				return fmt.Errorf("index: initialize Tantivy library: %w", err)
+			}
+			return nil
+		})
+	})
+	return tantivyInitErr
+}
+
+// withSuppressedProcessStdout is intentionally limited to synchronous native
+// initialization. os.DevNull maps to NUL on Windows and /dev/null on Unix.
+func withSuppressedProcessStdout(action func() error) (returnErr error) {
+	tantivyStdoutMu.Lock()
+	defer tantivyStdoutMu.Unlock()
+
+	sink, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("index: open null output: %w", err)
+	}
+	previous := os.Stdout
+	os.Stdout = sink
+	defer func() {
+		os.Stdout = previous
+		returnErr = errors.Join(returnErr, sink.Close())
+	}()
+	return action()
+}
+
 // OpenTantivy creates or opens the index and registers every tokenizer named
 // by the schema. Jieba is deliberately used for mixed Chinese/Latin text; see
 // ADR 0001.
@@ -105,8 +146,8 @@ func OpenTantivy(path string) (*Engine, error) {
 	if err := os.MkdirAll(path, 0o750); err != nil {
 		return nil, fmt.Errorf("index: create Tantivy directory: %w", err)
 	}
-	if err := tantivygo.LibInit(true, true, "off"); err != nil {
-		return nil, fmt.Errorf("index: initialize Tantivy library: %w", err)
+	if err := InitializeTantivy(); err != nil {
+		return nil, err
 	}
 	builder, err := tantivygo.NewSchemaBuilder()
 	if err != nil {

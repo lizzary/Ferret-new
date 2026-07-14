@@ -1,8 +1,10 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -399,13 +401,34 @@ func TestRunMarksCleanShutdown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	group := new(errgroup.Group)
-	group.Go(func() error { return Run(ctx, &cfg) })
+	var mirror bytes.Buffer
+	group.Go(func() error {
+		return RunWithOptions(ctx, &cfg, RunOptions{LogWriter: &mirror})
+	})
 
 	logPath := filepath.Join(cfg.DataDir, "logs", "indexnode.log")
 	waitForLog(t, logPath, "node lifecycle started")
 	cancel()
 	if err := group.Wait(); err != nil {
 		t.Fatalf("run lifecycle: %v", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(mirror.Bytes()))
+	foundLifecycleStart := false
+	for {
+		var entry map[string]any
+		err := decoder.Decode(&entry)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode mirrored lifecycle log: %v", err)
+		}
+		if entry["msg"] == "node lifecycle started" {
+			foundLifecycleStart = true
+		}
+	}
+	if !foundLifecycleStart {
+		t.Fatalf("mirrored lifecycle logs did not contain startup record: %s", mirror.String())
 	}
 
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 10*time.Second)

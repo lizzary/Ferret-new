@@ -39,24 +39,39 @@ make check
 
 ## Configuration and startup
 
-Start from [configs/indexnode.example.yaml](configs/indexnode.example.yaml). Every YAML key can be overridden with an `INDEXNODE_` environment variable by converting its dotted path to upper-case underscores, for example `watch.buffer_size` becomes `INDEXNODE_WATCH_BUFFER_SIZE`.
+Start from [configs/indexnode.example.yaml](configs/indexnode.example.yaml). Set `INDEXNODE_CONFIG` to select that startup YAML; when it is unset, the node uses its defaults plus field environment overrides. Every YAML key can be overridden with an `INDEXNODE_` environment variable by converting its dotted path to upper-case underscores, for example `watch.buffer_size` becomes `INDEXNODE_WATCH_BUFFER_SIZE`.
 
-```sh
-go run -buildvcs=false ./cmd/indexnode -config configs/indexnode.example.yaml
+```powershell
+$env:INDEXNODE_CONFIG = "configs/indexnode.example.yaml"
+go run -buildvcs=false ./cmd/indexnode
 ```
 
-An empty `node_id` is generated once and persisted under `data_dir`. Configure one or more `watch.roots`; after `/healthz` reports `ready`, creates, writes, moves, and removals flow through debounce into the durable queue automatically. M1's temporary control commands remain available for diagnostics before the gRPC control plane lands:
+When stdin and stdout are TTYs, startup opens the Bubble Tea dashboard. If either side is not a TTY, including redirected execution and IDE/compiler consoles without terminal support, startup automatically falls back to the plain long-running lifecycle. `-no-ui` explicitly selects the same plain lifecycle in a capable terminal. It is the executable's only application option; Go's flag package also supplies `-h`/`-help`.
 
-```sh
-go run -buildvcs=false ./cmd/indexnode -config configs/indexnode.example.yaml enqueue ./document.txt ./notes.md
-go run -buildvcs=false ./cmd/indexnode -config configs/indexnode.example.yaml
-go run -buildvcs=false ./cmd/indexnode -config configs/indexnode.example.yaml search -limit 20 "distributed indexing"
-go run -buildvcs=false ./cmd/indexnode -config configs/indexnode.example.yaml deadletters list -class permanent
-go run -buildvcs=false ./cmd/indexnode -config configs/indexnode.example.yaml deadletters redrive -file-ids 12,19
-go run -buildvcs=false ./cmd/indexnode -config configs/indexnode.example.yaml deadletters redrive -class poison
+`cmd/indexnode` is now only the thin composition root that loads configuration and selects the Bubble Tea or plain lifecycle frontend. It no longer routes positional subcommands or formats backend results as JSON.
+
+The dashboard currently exposes the completed M0-M4 surface:
+
+- `/status`, `/log`, and `/config` show lifecycle health, the bounded local JSON-log stream, and the resolved settings plus current YAML source selected from defaults, startup YAML, and field environment overrides.
+- `/stop` waits for the strict reverse-order lifecycle shutdown, while `/start` starts it again. `/quit` and `Ctrl+C` also wait for that clean shutdown before returning.
+- `/config load <path>` validates a different YAML while stopped and, on success, makes it the current configuration source for this UI session. Quote paths containing spaces, for example `/config load "D:\Index Node\indexnode.yaml"`.
+- `/config reload` reloads the current source while stopped. A failed load or reload preserves both the previous resolved configuration and its source; the next `/start` uses the last successful result. Neither command edits YAML or turns later-milestone fields into dynamic administration.
+- `/enqueue <path>...`, `/search [-limit N] <query>`, `/deadletters list [-class C] [-limit N]`, and `/deadletters redrive -file-ids 1,2` (or `-class poison`) are stopped-node Bubble Tea commands. Run `/stop` first; M8 will replace this owner-locked boundary with the live in-process control plane.
+- If a maintenance backend returns committed results together with a later close/audit error, Bubble Tea preserves those results in `/log` and warns the operator to verify them before retrying instead of reporting an unqualified failure.
+- `/theme auto|dark|light` persists terminal-only state in `<data_dir>/cli.json`. It does not rewrite the node YAML.
+
+The `/log` screen retains the Artifex terminal controls: arrow keys and Page Up/Page Down scroll, End follows the latest entry, `f` toggles follow mode, `1`-`4` select all/info/warn/error, and Escape returns home.
+
+The terminal visual shell and Frame Crab are adapted from Artifex commit `e9adee2c886031b1beae1c4548652104d6e98238` under its MIT license; the retained notice is in [`internal/cli/ARTIFEX_LICENSE`](internal/cli/ARTIFEX_LICENSE).
+
+An empty `node_id` is generated once and persisted under `data_dir`. Configure one or more `watch.roots`; after the dashboard or `/healthz` reports `ready`, creates, writes, moves, and removals flow through debounce into the durable queue automatically. Headless deployments run the same lifecycle without exposing a parallel maintenance command surface:
+
+```powershell
+$env:INDEXNODE_CONFIG = "configs/indexnode.example.yaml"
+go run -buildvcs=false ./cmd/indexnode -no-ui
 ```
 
-Global flags precede the command. `enqueue` stores absolute, cleaned paths at priority 0 and prints JSON task receipts; `search` prints JSON keyword hits. `deadletters` lists or redrives either explicit file IDs or one error class. These temporary one-shot commands are intended for use while the long-running node is stopped because the current Tantivy binding opens a writer even for search; M8 moves the same operations behind the in-process gRPC API.
+The old executable `enqueue`, `search`, and `deadletters` JSON subcommands have been removed. Their M0-M4 maintenance behavior is available only through the stopped-node Bubble Tea slash commands above; non-TTY and `-no-ui` execution intentionally provide lifecycle operation only. Use `INDEXNODE_CONFIG` to select YAML on the first launch or in headless execution; `/config load` changes the source only for the running Bubble Tea session. M8 moves live maintenance behind the in-process gRPC API.
 
 The metrics listener serves `/metrics` and `/healthz`. Health responses expose only aggregate root counts; local root paths are never included. Startup remains `warming` until the initial authoritative scan finishes. A repeatedly failing watcher reports `degraded`, while reconciliation still converges through the readable filesystem.
 
@@ -72,9 +87,9 @@ Transient task failures use jittered exponential backoff from 5 seconds to 30 mi
 
 Permanent errors and exhausted transient errors produce one generation-aware dead letter per file. The catalog is marked `failed`, while a minimal Tantivy document keeps its filename and path searchable. A higher-generation successful filesystem change clears the stale failure automatically. Dead letters can also be redriven manually or when the recorded extractor/model version differs from the active implementation. Records older than `dead_letter.retention_days` are synchronously archived to the audit JSONL stream before a generation-conditional delete. See [ADR 0004](docs/adr/0004-work-conserving-retry-budget.md) for the retry-budget borrowing rule.
 
-Dead-letter create and redrive audit events are staged transactionally in SQLite, then appended and fsynced to JSONL in durable order. Replay is at least once, so a crash in the final acknowledgement window may duplicate an event but cannot lose it. SQLite-backed one-shot commands acquire the same OS data-directory lock as the node and fail without opening the store when it is live. See [ADR 0005](docs/adr/0005-dead-letter-audit-outbox-and-instance-lock.md).
+Dead-letter create and redrive audit events are staged transactionally in SQLite, then appended and fsynced to JSONL in durable order. Replay is at least once, so a crash in the final acknowledgement window may duplicate an event but cannot lose it. SQLite-backed stopped-node maintenance acquires the same OS data-directory lock as the node and fails without opening the store when it is live. See [ADR 0005](docs/adr/0005-dead-letter-audit-outbox-and-instance-lock.md).
 
-Stopped-node one-shot commands preserve the existing crash marker: they do not run partial startup recovery or mark an earlier unclean process as clean. The next full node start performs recovery together with poison projection and audit replay.
+Stopped-node maintenance preserves the existing crash marker: it does not run partial startup recovery or mark an earlier unclean process as clean. The next full node start performs recovery together with poison projection and audit replay.
 
 ## Observability
 
@@ -86,11 +101,13 @@ File changes are detected by comparing `(size, mtime_ns, inode)` first. A sample
 
 ## Package boundaries
 
-The intended dependency direction is:
+The executable is a composition boundary, not a command-routing layer:
 
 ```text
-cmd -> lifecycle -> server/scheduler/pipeline/reconcile/reliability/watch/debounce
-    -> store/index/errclass/obs -> config
+cmd/indexnode (configuration + frontend selection only)
+    -> internal/cli -> internal/maintenance (typed stopped-node operations)
+    -> internal/lifecycle -> server/scheduler/pipeline/reconcile/reliability/watch/debounce
+internal/maintenance + internal/lifecycle -> store/index/errclass/obs -> config
 ```
 
 Third-party adapters stay confined to their designated wrapper files. Architecture-level deviations require an ADR under `docs/adr/`.
