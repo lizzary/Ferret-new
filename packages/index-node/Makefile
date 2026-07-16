@@ -13,9 +13,12 @@ coverage:
 	go test -buildvcs=false -count=1 -cover ./internal/store ./internal/debounce ./internal/errclass ./internal/scheduler
 
 proto:
-	buf generate
+	protoc -I api/proto \
+		--go_out=gen --go_opt=paths=source_relative \
+		--go-grpc_out=gen --go-grpc_opt=paths=source_relative \
+		api/proto/compute/v1/compute.proto
 
 lint:
-	go vet ./...
+	go vet -buildvcs=false ./...
 
 check: build lint test race coverage

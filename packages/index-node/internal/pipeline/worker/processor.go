@@ -8,16 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/lizzary/index-node/internal/errclass"
 	"github.com/lizzary/index-node/internal/index"
 	"github.com/lizzary/index-node/internal/pipeline"
+	"github.com/lizzary/index-node/internal/pipeline/embed"
 	"github.com/lizzary/index-node/internal/pipeline/extract"
 	"github.com/lizzary/index-node/internal/pipeline/iostage"
+	"github.com/lizzary/index-node/internal/pipeline/media"
 	"github.com/lizzary/index-node/internal/scheduler"
 	"github.com/lizzary/index-node/internal/store"
 	"golang.org/x/sync/errgroup"
@@ -57,6 +61,28 @@ type ProjectionReader interface {
 	GetFileDocument(context.Context, int64) (index.FileDocument, error)
 }
 
+// ImageProcessor is the still-image normalization boundary. Its concrete M5
+// implementation is media.ImageProcessor; the consumer-owned interface keeps
+// worker tests independent of image codecs.
+type ImageProcessor interface {
+	Match(path string, sniff []byte) bool
+	Process(context.Context, io.Reader) (pipeline.Frame, error)
+}
+
+// ImageEmbedder submits all frames belonging to one durable task. Implementors
+// must preserve frame metadata and return one embedding per input frame.
+type ImageEmbedder interface {
+	EmbedImagesForTask(context.Context, int64, []pipeline.Frame) ([]pipeline.Embedding, error)
+}
+
+// VectorProjector is both the durable vector-truth boundary and the rebuildable
+// ANN projection boundary. Both methods are generation fenced by the concrete
+// implementation.
+type VectorProjector interface {
+	Replace(context.Context, int64, int64, []store.Vector) error
+	Delete(context.Context, int64, int64) error
+}
+
 type Observer interface {
 	ObserveStage(stage, outcome string, elapsed time.Duration)
 	ObserveRetry(class errclass.Class)
@@ -80,6 +106,13 @@ type Config struct {
 	DeadLetterRecorder DeadLetterRecorder
 	ExtractorVersion   string
 	EmbedModelVersion  string
+	// CurrentEmbedModelVersion supersedes EmbedModelVersion when configured.
+	// It must report the latest durable successful compute handshake so terminal
+	// failures and poison provenance are eligible for the correct future redrive.
+	CurrentEmbedModelVersion func() string
+	ImageProcessor           ImageProcessor
+	ImageEmbedder            ImageEmbedder
+	VectorProjector          VectorProjector
 }
 
 type Processor struct {
@@ -101,6 +134,11 @@ func New(durable DurableStore, ioStage IOStage, extractor DocumentExtractor, com
 	}
 	if config.Workers < 1 {
 		return nil, errors.New("pipeline worker: workers must be positive")
+	}
+	mediaConfigured := config.ImageProcessor != nil || config.ImageEmbedder != nil || config.VectorProjector != nil
+	mediaComplete := config.ImageProcessor != nil && config.ImageEmbedder != nil && config.VectorProjector != nil
+	if mediaConfigured && !mediaComplete {
+		return nil, errors.New("pipeline worker: image processor, image embedder and vector projector must be configured together")
 	}
 	if config.RetryPolicy.Base() == 0 {
 		config.RetryPolicy = errclass.DefaultPolicy(nil)
@@ -158,6 +196,13 @@ func (processor *Processor) handleLease(ctx context.Context, lease scheduler.Lea
 		lease.Complete()
 		return nil
 	}
+	if errors.Is(err, embed.ErrWaitingDependency) {
+		// The embed controller has already moved this task from in_flight to
+		// waiting_dep in durable state. Applying retry/dead transitions here would
+		// both violate the state machine and consume an outage-free retry budget.
+		lease.Complete()
+		return nil
+	}
 	if ctx.Err() != nil {
 		// A component-tree failure deliberately leaves the task in_flight. The
 		// unclean-start recovery path requeues it and increments crash_count.
@@ -199,7 +244,7 @@ func (processor *Processor) handleLease(ctx context.Context, lease scheduler.Lea
 		Stage: stage, ErrorClass: class.String(), ErrorChain: errorChainJSON(err),
 		AttemptsLog: attemptsJSON(lease.Task, class, err, processor.config.Now()),
 	}
-	setDeadLetterVersions(&deadLetter, stage, processor.config.ExtractorVersion, processor.config.EmbedModelVersion)
+	setDeadLetterVersions(&deadLetter, stage, processor.config.ExtractorVersion, processor.currentEmbedModelVersion())
 	if transitionErr := processor.store.MarkDead(ctx, lease.Task.ID, deadLetter); transitionErr != nil {
 		return fmt.Errorf("pipeline worker: persist dead letter for task %d: %w", lease.Task.ID, errclass.Wrap(errclass.Fatal, transitionErr))
 	}
@@ -213,6 +258,16 @@ func (processor *Processor) handleLease(ctx context.Context, lease scheduler.Lea
 	}
 	lease.Complete()
 	return nil
+}
+
+func (processor *Processor) currentEmbedModelVersion() string {
+	if processor != nil && processor.config.CurrentEmbedModelVersion != nil {
+		return strings.TrimSpace(processor.config.CurrentEmbedModelVersion())
+	}
+	if processor == nil {
+		return ""
+	}
+	return strings.TrimSpace(processor.config.EmbedModelVersion)
 }
 
 func (processor *Processor) process(ctx context.Context, lease scheduler.Lease) (returnErr error) {
@@ -306,10 +361,36 @@ func (processor *Processor) loadTask(ctx context.Context, row store.Task) (pipel
 }
 
 func (processor *Processor) extractAndCommit(ctx context.Context, task pipeline.Task, result *iostage.Result) error {
-	defer func() { _ = result.Close() }()
+	handle := &ioResultHandle{result: result}
+	defer func() { _ = handle.Close() }()
+	if processor.config.ImageProcessor != nil && processor.config.ImageProcessor.Match(task.Row.Path, result.Sniff) {
+		return processor.imageAndCommit(ctx, task, result, handle)
+	}
+	return processor.documentAndCommit(ctx, task, result, handle)
+}
+
+type ioResultHandle struct {
+	result *iostage.Result
+	closed bool
+}
+
+func (handle *ioResultHandle) Close() error {
+	if handle == nil || handle.closed {
+		return nil
+	}
+	handle.closed = true
+	return handle.result.Close()
+}
+
+func (processor *Processor) documentAndCommit(
+	ctx context.Context,
+	task pipeline.Task,
+	result *iostage.Result,
+	handle *ioResultHandle,
+) error {
 	started := processor.config.Now()
 	doc, extractErr := processor.extract.Extract(ctx, task.Row.Path, result.Sniff, result.Reader, result.Meta)
-	closeErr := result.Close()
+	closeErr := handle.Close()
 	processor.observe("extract", "completed", started)
 	if extractErr != nil {
 		if errors.Is(extractErr, extract.ErrExtractorPanic) {
@@ -326,9 +407,70 @@ func (processor *Processor) extractAndCommit(ctx context.Context, task pipeline.
 	if err != nil {
 		return stageFailure("store", errclass.Wrap(errclass.Fatal, err))
 	}
+	if err := processor.deleteVectors(ctx, prepared.ID, prepared.Generation); err != nil {
+		return err
+	}
 	return processor.commit(ctx, task.Row.ID, prepared, index.FileDocument{
 		FileID: prepared.ID, Path: prepared.Path, Filename: filepath.Base(prepared.Path),
 		Kind: string(prepared.Kind), Content: doc.Content, MTimeNS: prepared.MTimeNS,
+		Generation: prepared.Generation, Status: string(store.FileStatusIndexed),
+	})
+}
+
+func (processor *Processor) imageAndCommit(
+	ctx context.Context,
+	task pipeline.Task,
+	result *iostage.Result,
+	handle *ioResultHandle,
+) error {
+	started := processor.config.Now()
+	frame, mediaErr := processor.config.ImageProcessor.Process(ctx, result.Reader)
+	// Decoding is the last consumer of the open filesystem reader. Release both
+	// IO semaphores before catalog writes or a potentially slow compute RPC.
+	closeErr := handle.Close()
+	processor.observe("media", "completed", started)
+	if mediaErr != nil {
+		return stageFailure("media", classifyMediaError(mediaErr))
+	}
+	if closeErr != nil {
+		return stageFailure("io", closeErr)
+	}
+	if err := validateStillImageFrame(frame); err != nil {
+		return stageFailure("media", errclass.Wrap(errclass.Permanent, err))
+	}
+
+	file := fileFromImageResult(task, result.Meta)
+	prepared, err := processor.store.PrepareFileForTask(ctx, task.Row.ID, file)
+	if err != nil {
+		return stageFailure("store", errclass.Wrap(errclass.Fatal, err))
+	}
+
+	frames := []pipeline.Frame{frame}
+	started = processor.config.Now()
+	embeddings, embedErr := processor.config.ImageEmbedder.EmbedImagesForTask(ctx, task.Row.ID, frames)
+	processor.observe("embed", "completed", started)
+	if embedErr != nil {
+		return stageFailure("embed", classifyEmbedError(embedErr))
+	}
+	vectors, modelVersion, err := vectorsFromEmbeddings(prepared.ID, frames, embeddings)
+	if err != nil {
+		return stageFailure("embed", classifyEmbedError(err))
+	}
+
+	started = processor.config.Now()
+	err = processor.config.VectorProjector.Replace(ctx, prepared.ID, prepared.Generation, vectors)
+	processor.observe("vector", "completed", started)
+	if err != nil {
+		return stageFailure("vector", err)
+	}
+	// VectorProjector.Replace persists this exact version together with vector
+	// truth before the Tantivy receipt completes the task. Keep the local file
+	// snapshot aligned with that commit boundary; never substitute the static
+	// runtime/dead-letter version from Config.
+	prepared.EmbedModelVersion = optionalString(modelVersion)
+	return processor.commit(ctx, task.Row.ID, prepared, index.FileDocument{
+		FileID: prepared.ID, Path: prepared.Path, Filename: filepath.Base(prepared.Path),
+		Kind: string(store.FileKindImage), Content: "", MTimeNS: prepared.MTimeNS,
 		Generation: prepared.Generation, Status: string(store.FileStatusIndexed),
 	})
 }
@@ -350,10 +492,26 @@ func (processor *Processor) remove(ctx context.Context, task pipeline.Task) erro
 			return stageFailure("store", errclass.Wrap(errclass.Fatal, err))
 		}
 	}
+	if err := processor.deleteVectors(ctx, file.ID, task.Generation); err != nil {
+		return err
+	}
 	return processor.submit(ctx, index.CommitOp{
 		TaskID: task.Row.ID, FileID: file.ID, Generation: task.Generation,
 		Mutation: index.Mutation{Kind: index.MutationDeleteFile, FileID: file.ID, Generation: task.Generation},
 	})
+}
+
+func (processor *Processor) deleteVectors(ctx context.Context, fileID, generation int64) error {
+	if processor.config.VectorProjector == nil {
+		return nil
+	}
+	started := processor.config.Now()
+	err := processor.config.VectorProjector.Delete(ctx, fileID, generation)
+	processor.observe("vector", "completed", started)
+	if err != nil {
+		return stageFailure("vector", err)
+	}
+	return nil
 }
 
 func (processor *Processor) fastPath(ctx context.Context, task pipeline.Task, result *iostage.Result) error {
@@ -469,6 +627,106 @@ func fileFromResult(task pipeline.Task, meta pipeline.FileMeta, doc pipeline.Doc
 	}
 }
 
+func fileFromImageResult(task pipeline.Task, meta pipeline.FileMeta) store.File {
+	return store.File{
+		Path: task.Row.Path, Size: meta.Size, MTimeNS: meta.MTimeNS,
+		Inode: meta.Inode, SampleHash: append([]byte(nil), meta.SampleHash...),
+		Kind: store.FileKindImage, Generation: task.Generation, Status: store.FileStatusPending,
+	}
+}
+
+func validateStillImageFrame(frame pipeline.Frame) error {
+	if frame.FrameIndex != 0 {
+		return fmt.Errorf("media image: still-image frame index is %d, want 0", frame.FrameIndex)
+	}
+	if frame.FrameTSMS != nil {
+		return errors.New("media image: still-image frame timestamp must be empty")
+	}
+	if len(frame.JPEG) == 0 {
+		return errors.New("media image: normalized JPEG is empty")
+	}
+	return nil
+}
+
+func vectorsFromEmbeddings(
+	fileID int64,
+	frames []pipeline.Frame,
+	embeddings []pipeline.Embedding,
+) ([]store.Vector, string, error) {
+	if len(embeddings) != len(frames) {
+		return nil, "", &embed.ResponseError{Problem: fmt.Sprintf(
+			"embedding cardinality %d does not match frame cardinality %d", len(embeddings), len(frames),
+		)}
+	}
+	if len(embeddings) == 0 {
+		return nil, "", &embed.ResponseError{Problem: "embedding response is empty"}
+	}
+	modelVersion := embeddings[0].ModelVersion
+	if strings.TrimSpace(modelVersion) == "" || strings.TrimSpace(modelVersion) != modelVersion {
+		return nil, "", &embed.ResponseError{Problem: "model version is empty or has surrounding whitespace"}
+	}
+	dimensions := len(embeddings[0].Values)
+	if dimensions == 0 {
+		return nil, "", &embed.ResponseError{Problem: "embedding vector has no dimensions"}
+	}
+	vectors := make([]store.Vector, len(embeddings))
+	seenFrames := make(map[int]struct{}, len(embeddings))
+	for position, embedding := range embeddings {
+		frame := frames[position]
+		if embedding.FrameIndex != frame.FrameIndex || !sameTimestamp(embedding.FrameTSMS, frame.FrameTSMS) {
+			return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("embedding %d does not match its frame metadata", position)}
+		}
+		if _, duplicate := seenFrames[embedding.FrameIndex]; duplicate {
+			return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("duplicate frame index %d", embedding.FrameIndex)}
+		}
+		seenFrames[embedding.FrameIndex] = struct{}{}
+		if embedding.FrameIndex < 0 || embedding.FrameIndex >= 1<<16 {
+			return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("frame index %d is outside 0..65535", embedding.FrameIndex)}
+		}
+		if embedding.FrameTSMS != nil && *embedding.FrameTSMS < 0 {
+			return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("frame %d has a negative timestamp", embedding.FrameIndex)}
+		}
+		if embedding.ModelVersion != modelVersion {
+			return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("embedding %d model %q does not match %q", position, embedding.ModelVersion, modelVersion)}
+		}
+		if len(embedding.Values) != dimensions {
+			return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("embedding %d has %d dimensions, want %d", position, len(embedding.Values), dimensions)}
+		}
+		var squaredNorm float64
+		for valueIndex, value := range embedding.Values {
+			converted := float64(value)
+			if math.IsNaN(converted) || math.IsInf(converted, 0) {
+				return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("embedding %d value %d is not finite", position, valueIndex)}
+			}
+			squaredNorm += converted * converted
+		}
+		if math.IsNaN(squaredNorm) || math.IsInf(squaredNorm, 0) || math.Abs(math.Sqrt(squaredNorm)-1) > 1e-3 {
+			return nil, "", &embed.ResponseError{Problem: fmt.Sprintf("embedding %d is not L2 normalized", position)}
+		}
+		vectors[position] = store.Vector{
+			FileID: fileID, FrameIndex: embedding.FrameIndex,
+			FrameTSMS: cloneTimestamp(embedding.FrameTSMS),
+			Values:    append([]float32(nil), embedding.Values...), ModelVersion: modelVersion,
+		}
+	}
+	return vectors, modelVersion, nil
+}
+
+func sameTimestamp(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func cloneTimestamp(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
 type stagedError struct {
 	stage string
 	err   error
@@ -502,6 +760,24 @@ func outcomeOf(result *iostage.Result) string {
 func classifyIOError(err error) error {
 	if errors.Is(err, iostage.ErrFileTooLarge) || errors.Is(err, iostage.ErrNotRegular) || errors.Is(err, iostage.ErrInvalidTask) {
 		return errclass.Wrap(errclass.Permanent, err)
+	}
+	return err
+}
+
+func classifyMediaError(err error) error {
+	if errors.Is(err, media.ErrUnsupportedImage) || errors.Is(err, media.ErrImageTooLarge) ||
+		errors.Is(err, media.ErrImagePanic) || errors.Is(err, media.ErrInvalidImageConfig) {
+		return errclass.Wrap(errclass.Permanent, err)
+	}
+	return err
+}
+
+func classifyEmbedError(err error) error {
+	if errors.Is(err, embed.ErrInvalidResponse) {
+		return errclass.Wrap(errclass.Permanent, err)
+	}
+	if errors.Is(err, embed.ErrStaleModelResponse) {
+		return errclass.Wrap(errclass.Transient, err)
 	}
 	return err
 }
@@ -553,7 +829,7 @@ func setDeadLetterVersions(info *store.DeadLetterInfo, stage, extractorVersion, 
 	switch stage {
 	case "extract":
 		info.ExtractorVersion = optionalString(extractorVersion)
-	case "embed":
+	case "embed", "vector":
 		info.EmbedModelVersion = optionalString(embedModelVersion)
 	case "worker", "unknown":
 		// A boundary panic has no trustworthy inner stage. Recording both active

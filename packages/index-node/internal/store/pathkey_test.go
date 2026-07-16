@@ -44,7 +44,7 @@ func TestPathKeyMigrationBackfillsLegacyRowsAndIndexes(t *testing.T) {
 	}
 
 	var version int
-	if err := durable.read.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 4 {
+	if err := durable.read.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 6 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	var filePath, fileKey string

@@ -14,6 +14,7 @@ watch:
 
 compute:
   endpoint: dns:///compute:7801 # Use localhost or in-process wiring for standalone mode.
+  request_timeout: 30s
   batch_size: 32
   batch_linger: 100ms
   inflight_batches: 8
@@ -27,6 +28,10 @@ pipeline:
   cpu_percent_cap: 50
   max_file_size: 536870912
   max_extract_bytes: 2097152
+  image_size: 384
+  image_jpeg_quality: 90
+  image_max_pixels: 25000000
+  image_bytes_inflight: 268435456
   video_frames: 5
   ffmpeg_path: ffmpeg
 
@@ -38,6 +43,7 @@ index:
     ef_construction: 200
     ef_search: 64
     snapshot_interval: 10m
+    snapshot_changes: 5000
 
 retry:
   base: 5s

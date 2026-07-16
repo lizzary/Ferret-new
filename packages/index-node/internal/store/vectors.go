@@ -7,9 +7,33 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 )
 
 const vectorColumns = `file_id,frame_idx,frame_ts_ms,dims,vector,model_version`
+
+var ErrEmbedModelContract = errors.New("store: embed model contract mismatch")
+
+// EmbedModelContractError reports an attempt to reuse one model-version label
+// with a different vector width. Such a response is locally reachable but
+// cannot share an ANN space with vectors already committed under that label.
+type EmbedModelContractError struct {
+	ModelVersion string
+	GotDims      int
+	WantDims     int
+}
+
+func (failure *EmbedModelContractError) Error() string {
+	if failure == nil {
+		return ErrEmbedModelContract.Error()
+	}
+	return fmt.Sprintf(
+		"%s: model %q has %d dimensions, durable contract requires %d",
+		ErrEmbedModelContract, failure.ModelVersion, failure.GotDims, failure.WantDims,
+	)
+}
+
+func (*EmbedModelContractError) Is(target error) bool { return target == ErrEmbedModelContract }
 
 func validateVector(vector Vector) error {
 	if vector.FileID <= 0 {
@@ -18,14 +42,17 @@ func validateVector(vector Vector) error {
 	if vector.FrameIndex < 0 {
 		return errors.New("store: vector frame index is negative")
 	}
+	if vector.FrameIndex >= 1<<16 {
+		return errors.New("store: vector frame index must be less than 65536")
+	}
 	if vector.FrameTSMS != nil && *vector.FrameTSMS < 0 {
 		return errors.New("store: vector frame timestamp is negative")
 	}
 	if len(vector.Values) == 0 {
 		return errors.New("store: vector has no dimensions")
 	}
-	if vector.ModelVersion == "" {
-		return errors.New("store: vector model version is empty")
+	if strings.TrimSpace(vector.ModelVersion) == "" || strings.TrimSpace(vector.ModelVersion) != vector.ModelVersion {
+		return errors.New("store: vector model version is invalid")
 	}
 	var normSquared float64
 	for _, value := range vector.Values {
@@ -99,6 +126,9 @@ func putVectorTx(ctx context.Context, tx *sql.Tx, vector Vector) error {
 	if err := validateVector(vector); err != nil {
 		return err
 	}
+	if err := requireEmbedModelContractTx(ctx, tx, vector.ModelVersion, len(vector.Values)); err != nil {
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO vectors(file_id,frame_idx,frame_ts_ms,dims,vector,model_version)
 		VALUES(?,?,?,?,?,?)
@@ -134,16 +164,145 @@ func (s *Store) ReplaceVectorsForFile(ctx context.Context, fileID, generation in
 		if err := requireCurrentGenerationTx(ctx, tx, fileID, generation); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "DELETE FROM vectors WHERE file_id=?", fileID); err != nil {
-			return fmt.Errorf("store: clear vectors for file %d: %w", fileID, err)
+		if err := requireVectorContractsTx(ctx, tx, vectors); err != nil {
+			return err
 		}
-		for _, vector := range vectors {
-			if err := putVectorTx(ctx, tx, vector); err != nil {
-				return err
-			}
+		return replaceVectorsTx(ctx, tx, fileID, vectors)
+	})
+}
+
+// ReplaceVectorsForFileAndVersion couples vector truth and the per-file catalog
+// model marker in one generation-fenced transaction. It deliberately does not
+// mutate active_embed_model_version: that process-wide value is owned by the
+// successful EmbedService handshake, and an older in-flight vector write must
+// never roll a newly observed service model back.
+func (s *Store) ReplaceVectorsForFileAndVersion(
+	ctx context.Context,
+	fileID, generation int64,
+	modelVersion string,
+	vectors []Vector,
+) error {
+	if fileID <= 0 {
+		return errors.New("store: vector file ID must be positive")
+	}
+	if generation < 1 {
+		return errors.New("store: vector generation must be positive")
+	}
+	if strings.TrimSpace(modelVersion) == "" || strings.TrimSpace(modelVersion) != modelVersion {
+		return errors.New("store: vector model version is invalid")
+	}
+	if len(vectors) == 0 {
+		return errors.New("store: vector replacement is empty")
+	}
+	for _, vector := range vectors {
+		if vector.FileID != fileID {
+			return fmt.Errorf("store: vector file ID %d does not match replacement file %d", vector.FileID, fileID)
+		}
+		if vector.ModelVersion != modelVersion {
+			return fmt.Errorf("store: vector model %q does not match replacement model %q", vector.ModelVersion, modelVersion)
+		}
+		if err := validateVector(vector); err != nil {
+			return err
+		}
+	}
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := requireCurrentGenerationTx(ctx, tx, fileID, generation); err != nil {
+			return err
+		}
+		if err := requireVectorContractsTx(ctx, tx, vectors); err != nil {
+			return err
+		}
+		if err := replaceVectorsTx(ctx, tx, fileID, vectors); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE files SET embed_model_version=? WHERE file_id=? AND generation=?`,
+			modelVersion, fileID, generation)
+		if err != nil {
+			return fmt.Errorf("store: set vector model for file %d: %w", fileID, err)
+		}
+		if err := requireChanged(result); err != nil {
+			return err
 		}
 		return nil
 	})
+}
+
+func requireVectorContractsTx(ctx context.Context, tx *sql.Tx, vectors []Vector) error {
+	for _, vector := range vectors {
+		if err := requireEmbedModelContractTx(ctx, tx, vector.ModelVersion, len(vector.Values)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// requireEmbedModelContractTx establishes the durable (model_version,dims)
+// pair before a vector can be committed. Databases upgraded from early M5
+// builds have vector rows but no contract rows; inspect those rows first and
+// backfill only when every existing vector for the model agrees.
+func requireEmbedModelContractTx(ctx context.Context, tx *sql.Tx, modelVersion string, dims int) error {
+	if modelVersion == "" {
+		return errors.New("store: vector model version is empty")
+	}
+	if dims <= 0 {
+		return errors.New("store: vector dimensions must be positive")
+	}
+
+	var durableDims int
+	err := tx.QueryRowContext(ctx,
+		"SELECT dims FROM embed_model_contracts WHERE model_version=?", modelVersion,
+	).Scan(&durableDims)
+	switch {
+	case err == nil:
+		if durableDims != dims {
+			return &EmbedModelContractError{ModelVersion: modelVersion, GotDims: dims, WantDims: durableDims}
+		}
+		return nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("store: read embed model contract for %q: %w", modelVersion, err)
+	}
+
+	var count int64
+	var minimum, maximum sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*),MIN(dims),MAX(dims) FROM vectors WHERE model_version=?`,
+		modelVersion,
+	).Scan(&count, &minimum, &maximum); err != nil {
+		return fmt.Errorf("store: inspect legacy vector dimensions for %q: %w", modelVersion, err)
+	}
+	if count != 0 {
+		if !minimum.Valid || !maximum.Valid || minimum.Int64 != maximum.Int64 {
+			return fmt.Errorf("%w: legacy vectors for model %q have inconsistent dimensions",
+				ErrEmbedModelContract, modelVersion)
+		}
+		durableDims = int(minimum.Int64)
+		if durableDims != dims {
+			return &EmbedModelContractError{ModelVersion: modelVersion, GotDims: dims, WantDims: durableDims}
+		}
+	} else {
+		durableDims = dims
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO embed_model_contracts(model_version,dims) VALUES(?,?)`,
+		modelVersion, durableDims,
+	); err != nil {
+		return fmt.Errorf("store: establish embed model contract for %q: %w", modelVersion, err)
+	}
+	return nil
+}
+
+func replaceVectorsTx(ctx context.Context, tx *sql.Tx, fileID int64, vectors []Vector) error {
+	if _, err := tx.ExecContext(ctx, "DELETE FROM vectors WHERE file_id=?", fileID); err != nil {
+		return fmt.Errorf("store: clear vectors for file %d: %w", fileID, err)
+	}
+	for _, vector := range vectors {
+		if err := putVectorTx(ctx, tx, vector); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func requireCurrentGenerationTx(ctx context.Context, tx *sql.Tx, fileID, generation int64) error {
@@ -211,6 +370,33 @@ func (s *Store) VisitVectors(ctx context.Context, visit func(Vector) error) erro
 	return rows.Err()
 }
 
+// VisitVectorsByModel streams only the truth rows compatible with one model.
+// A model upgrade can therefore build a dimension-consistent side graph while
+// older files are being redriven.
+func (s *Store) VisitVectorsByModel(ctx context.Context, modelVersion string, visit func(Vector) error) error {
+	if modelVersion == "" {
+		return errors.New("store: vector model version is empty")
+	}
+	if visit == nil {
+		return errors.New("store: nil vector visitor")
+	}
+	rows, err := s.read.QueryContext(ctx, "SELECT "+vectorColumns+" FROM vectors WHERE model_version=? ORDER BY file_id,frame_idx", modelVersion)
+	if err != nil {
+		return fmt.Errorf("store: stream vectors for model %q: %w", modelVersion, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		vector, err := scanVector(rows)
+		if err != nil {
+			return fmt.Errorf("store: scan streamed vector for model %q: %w", modelVersion, err)
+		}
+		if err := visit(vector); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 func (s *Store) HasVectorAtTimestamp(ctx context.Context, fileID, timestampMS int64) (bool, error) {
 	var exists int
 	if err := s.read.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM vectors WHERE file_id=? AND frame_ts_ms=?)", fileID, timestampMS).Scan(&exists); err != nil {
@@ -227,7 +413,46 @@ func (s *Store) DeleteVectorsByFile(ctx context.Context, fileID int64) (int64, e
 			return fmt.Errorf("store: delete vectors for file %d: %w", fileID, err)
 		}
 		count, err = result.RowsAffected()
-		return err
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE files SET embed_model_version=NULL WHERE file_id=?`, fileID); err != nil {
+			return fmt.Errorf("store: clear vector model for file %d: %w", fileID, err)
+		}
+		return nil
+	})
+	return count, err
+}
+
+// DeleteVectorsForFile applies a generation fence in the same transaction as
+// deletion. It is the pipeline-safe counterpart of DeleteVectorsByFile, which
+// remains available for stopped-node maintenance.
+func (s *Store) DeleteVectorsForFile(ctx context.Context, fileID, generation int64) (int64, error) {
+	if fileID <= 0 {
+		return 0, errors.New("store: vector file ID must be positive")
+	}
+	if generation < 1 {
+		return 0, errors.New("store: vector generation must be positive")
+	}
+	var count int64
+	err := s.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := requireCurrentGenerationTx(ctx, tx, fileID, generation); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, "DELETE FROM vectors WHERE file_id=?", fileID)
+		if err != nil {
+			return fmt.Errorf("store: delete current vectors for file %d: %w", fileID, err)
+		}
+		count, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE files SET embed_model_version=NULL WHERE file_id=? AND generation=?`, fileID, generation); err != nil {
+			return fmt.Errorf("store: clear vector model for file %d: %w", fileID, err)
+		}
+		return nil
 	})
 	return count, err
 }
@@ -247,4 +472,113 @@ func (s *Store) VectorModelVersions(ctx context.Context) ([]string, error) {
 		versions = append(versions, version)
 	}
 	return versions, rows.Err()
+}
+
+// LatestVectorModelVersion selects the model attached to the most recently
+// completed catalog projection. Pending rows are used only when no indexed
+// vector exists, which makes corrupted-snapshot fallback deterministic during
+// a rolling model upgrade.
+func (s *Store) LatestVectorModelVersion(ctx context.Context) (string, error) {
+	var version string
+	err := s.read.QueryRowContext(ctx, `
+		SELECT v.model_version
+		FROM vectors v JOIN files f ON f.file_id=v.file_id
+		ORDER BY (f.status='indexed') DESC, COALESCE(f.indexed_at,0) DESC,
+		         f.generation DESC, v.rowid DESC
+		LIMIT 1`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: read latest vector model version: %w", err)
+	}
+	return version, nil
+}
+
+// MaxVectorRevision returns the latest durable recovery-stream watermark.
+func (s *Store) MaxVectorRevision(ctx context.Context) (int64, error) {
+	var revision int64
+	// MAX(revision) falls back to zero after a successful snapshot prunes the
+	// covered rows. AUTOINCREMENT's sqlite_sequence entry is the durable high
+	// watermark and is intentionally retained across DELETE.
+	if err := s.read.QueryRowContext(ctx, `
+		SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='vector_changes'), 0)`).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("store: read vector revision: %w", err)
+	}
+	return revision, nil
+}
+
+// VisitVectorChangesAfter replays changes in strict revision order without
+// retaining the stream in memory.
+func (s *Store) VisitVectorChangesAfter(ctx context.Context, after int64, visit func(VectorChange) error) error {
+	if after < 0 {
+		return errors.New("store: vector revision is negative")
+	}
+	if visit == nil {
+		return errors.New("store: nil vector change visitor")
+	}
+	rows, err := s.read.QueryContext(ctx, `
+		SELECT revision,file_id,frame_idx,op,frame_ts_ms,dims,vector,model_version,changed_at
+		FROM vector_changes WHERE revision>? ORDER BY revision`, after)
+	if err != nil {
+		return fmt.Errorf("store: stream vector changes after %d: %w", after, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var change VectorChange
+		var op string
+		var frameTS, dims sql.NullInt64
+		var blob []byte
+		var model sql.NullString
+		if err := rows.Scan(
+			&change.Revision, &change.FileID, &change.FrameIndex, &op,
+			&frameTS, &dims, &blob, &model, &change.ChangedAtMS,
+		); err != nil {
+			return fmt.Errorf("store: scan vector change: %w", err)
+		}
+		change.Op = VectorChangeOp(op)
+		if frameTS.Valid {
+			change.FrameTSMS = ptr(frameTS.Int64)
+		}
+		if model.Valid {
+			change.ModelVersion = model.String
+		}
+		switch change.Op {
+		case VectorChangeUpsert:
+			if !dims.Valid {
+				return fmt.Errorf("store: vector change %d has no dimensions", change.Revision)
+			}
+			values, err := decodeVector(blob, int(dims.Int64))
+			if err != nil {
+				return fmt.Errorf("store: decode vector change %d: %w", change.Revision, err)
+			}
+			change.Values = values
+		case VectorChangeDelete:
+		default:
+			return fmt.Errorf("store: vector change %d has invalid operation %q", change.Revision, op)
+		}
+		if err := visit(change); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// PruneVectorChangesThrough removes recovery records already covered by an
+// atomically installed snapshot. A damaged snapshot still falls back to the
+// vectors truth table, so pruning never removes the authoritative data.
+func (s *Store) PruneVectorChangesThrough(ctx context.Context, revision int64) (int64, error) {
+	if revision < 0 {
+		return 0, errors.New("store: vector revision is negative")
+	}
+	var count int64
+	err := s.WithTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, "DELETE FROM vector_changes WHERE revision<=?", revision)
+		if err != nil {
+			return fmt.Errorf("store: prune vector changes through %d: %w", revision, err)
+		}
+		count, err = result.RowsAffected()
+		return err
+	})
+	return count, err
 }

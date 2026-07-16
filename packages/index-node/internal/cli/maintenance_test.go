@@ -51,7 +51,7 @@ func TestExecuteMaintenanceHelpDoesNotRequireConfiguration(t *testing.T) {
 		want      []string
 	}{
 		{"enqueue", []string{"-help"}, []string{"/enqueue <path>... - enqueue paths while stopped"}},
-		{"search", []string{"--help"}, []string{"/search [-limit N] <query> - keyword search"}},
+		{"search", []string{"--help"}, maintenanceHelp("search")},
 		{"deadletters", []string{"-h"}, maintenanceHelp("deadletters")},
 		{"deadletters", []string{"list", "--help"}, []string{"/deadletters list [-class C] [-limit N]"}},
 		{"deadletters", []string{"redrive", "-help"}, maintenanceHelp("deadletters-redrive")},
@@ -89,7 +89,22 @@ func TestMaintenanceArgumentErrors(t *testing.T) {
 		{"search lower limit", "search", []string{"-limit", "0", "query"}, "limit must be between 1 and 1000"},
 		{"search upper limit", "search", []string{"--limit=1001", "query"}, "limit must be between 1 and 1000"},
 		{"search duplicate limit", "search", []string{"-limit", "1", "--limit=2", "query"}, "provided only once"},
-		{"search unknown option", "search", []string{"-kind", "text", "query"}, `unknown option "-kind"`},
+		{"search unknown option", "search", []string{"-bogus", "text", "query"}, `unknown option "-bogus"`},
+		{"search invalid mode", "search", []string{"-mode", "fuzzy", "query"}, `invalid mode "fuzzy"`},
+		{"search missing mode", "search", []string{"-mode"}, `-mode requires a value`},
+		{"search duplicate mode", "search", []string{"-mode", "hybrid", "-mode", "keyword", "query"}, `-mode may be provided only once`},
+		{"search invalid kind", "search", []string{"-kind", "archive", "query"}, `invalid kind "archive"`},
+		{"search empty kind", "search", []string{"-kind", "text,,image", "query"}, `invalid kind ""`},
+		{"search missing kind", "search", []string{"-kind"}, `-kind requires a value`},
+		{"search invalid mtime", "search", []string{"-mtime-from-ns", "tomorrow", "query"}, `invalid -mtime-from-ns`},
+		{"search overflowing mtime", "search", []string{"-mtime-to-ns", "9223372036854775808", "query"}, `invalid -mtime-to-ns`},
+		{"search missing mtime", "search", []string{"-mtime-to-ns"}, `-mtime-to-ns requires a value`},
+		{"search duplicate mtime", "search", []string{"-mtime-from-ns", "1", "-mtime-from-ns", "2", "query"}, `-mtime-from-ns may be provided only once`},
+		{"search inverted mtime", "search", []string{"-mtime-from-ns", "2", "-mtime-to-ns", "1", "query"}, `mtime range is inverted`},
+		{"search duplicate path", "search", []string{"-path-prefix", "/a", "-path-prefix", "/b", "query"}, `-path-prefix may be provided only once`},
+		{"search missing path", "search", []string{"-path-prefix"}, `-path-prefix requires a value`},
+		{"search empty path", "search", []string{"-path-prefix=", "query"}, `path prefix is empty`},
+		{"search NUL path", "search", []string{"-path-prefix", "bad\x00path", "query"}, `path prefix contains NUL`},
 		{"deadletters subcommand", "deadletters", nil, "expected list or redrive"},
 		{"deadletters unknown", "deadletters", []string{"purge"}, `unknown subcommand "purge"`},
 		{"list positional", "deadletters", []string{"list", "extra"}, `unexpected argument "extra"`},
@@ -131,6 +146,21 @@ func TestParseSearchArguments(t *testing.T) {
 		{"inline long option", []string{"--limit=8", "needle"}, searchMaintenanceRequest{query: "needle", limit: 8}},
 		{"option after word", []string{"two", "--limit", "9", "words"}, searchMaintenanceRequest{query: "two words", limit: 9}},
 		{"option terminator", []string{"--", "-literal", "query"}, searchMaintenanceRequest{query: "-literal query", limit: 20}},
+		{
+			"complete semantic filters",
+			[]string{
+				"-mode", "semantic", "-path-prefix=/root", "-kind", "text,image",
+				"--kind=video,text", "-mtime-from-ns", "-10", "--mtime-to-ns=20", "needle",
+			},
+			searchMaintenanceRequest{
+				query: "needle", mode: index.ModeSemantic, limit: 20,
+				filters: index.Filters{
+					PathPrefix:  "/root",
+					Kinds:       []store.FileKind{store.FileKindText, store.FileKindImage, store.FileKindVideo},
+					MTimeFromNS: int64Pointer(-10), MTimeToNS: int64Pointer(20),
+				},
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -144,6 +174,44 @@ func TestParseSearchArguments(t *testing.T) {
 				t.Fatalf("parseSearchArguments() = %#v, want %#v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestExecuteMaintenanceForwardsTypedSearchRequest(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{DataDir: t.TempDir()}
+	var captured index.SearchRequest
+	lines, err := executeMaintenanceWithSearch(
+		context.Background(),
+		cfg,
+		"search",
+		[]string{
+			"-mode", "keyword", "-limit", "3", "-kind", "text,image", "-path-prefix", "/root",
+			"-mtime-from-ns", "10", "-mtime-to-ns", "20", "needle",
+		},
+		func(_ context.Context, gotConfig *config.Config, request index.SearchRequest) (index.SearchResponse, error) {
+			if gotConfig != cfg {
+				t.Fatal("typed search did not receive the resolved config")
+			}
+			captured = request
+			return index.SearchResponse{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeMaintenanceWithSearch: %v", err)
+	}
+	want := index.SearchRequest{
+		Query: "needle", Mode: index.ModeKeyword, TopK: 3,
+		Filters: index.Filters{
+			PathPrefix: "/root", Kinds: []store.FileKind{store.FileKindText, store.FileKindImage},
+			MTimeFromNS: int64Pointer(10), MTimeToNS: int64Pointer(20),
+		},
+	}
+	if !reflect.DeepEqual(captured, want) {
+		t.Fatalf("captured request = %#v, want %#v", captured, want)
+	}
+	if !reflect.DeepEqual(lines, []string{"Search returned 0 hit(s)."}) {
+		t.Fatalf("formatted lines = %#v", lines)
 	}
 }
 
@@ -183,14 +251,27 @@ func TestMaintenanceResultFormatting(t *testing.T) {
 		t.Fatalf("formatEnqueueResults() = %#v, want %#v", enqueued, want)
 	}
 
-	hits := formatSearchResults([]index.KeywordHit{
-		{FileID: 7, Score: 1.25, Status: "indexed", Kind: "text", Path: "/document"},
-	})
+	frameTimestamp := int64(1234)
+	hits := formatSearchResults(index.SearchResponse{Hits: []index.Hit{{
+		FileID: 7, Score: 1.25, Status: store.FileStatusIndexed, Kind: store.FileKindVideo,
+		Path: "/document", Sources: []string{index.SourceContent, index.SourceSemantic},
+		Snippet: "matched text", FrameTSMS: &frameTimestamp,
+	}}, DegradedSemantic: true, Incomplete: true})
 	if want := []string{
-		"Keyword search returned 1 hit(s).",
-		"file=7 score=1.2500 status=indexed kind=text /document",
+		"Search returned 1 hit(s). Semantic search unavailable; results are degraded. Candidate limit reached; results may be incomplete.",
+		`file=7 score=1.250000 sources=content,semantic frame_ts_ms=1234 status=indexed kind=video path="/document" snippet="matched text"`,
 	}; !reflect.DeepEqual(hits, want) {
 		t.Fatalf("formatSearchResults() = %#v, want %#v", hits, want)
+	}
+	plain := formatSearchResults(index.SearchResponse{Hits: []index.Hit{{
+		FileID: 8, Score: 0.5, Status: store.FileStatusIndexed,
+		Kind: store.FileKindText, Path: "/plain",
+	}}})
+	if want := []string{
+		"Search returned 1 hit(s).",
+		`file=8 score=0.500000 sources=- frame_ts_ms=- status=indexed kind=text path="/plain" snippet=""`,
+	}; !reflect.DeepEqual(plain, want) {
+		t.Fatalf("formatSearchResults(plain) = %#v, want %#v", plain, want)
 	}
 
 	dead := store.DeadLetter{FileID: 9, Generation: 4, ErrorClass: "poison", Stage: "extract", Path: "/broken"}
@@ -215,3 +296,5 @@ func TestMaintenanceResultFormatting(t *testing.T) {
 		t.Fatalf("formatDeadLetterRedrive() = %#v, want %#v", redriven, want)
 	}
 }
+
+func int64Pointer(value int64) *int64 { return &value }

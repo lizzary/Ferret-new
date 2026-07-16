@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +30,33 @@ type fakeStore struct {
 	listed         chan struct{}
 	listOnce       sync.Once
 	order          *[]string
+}
+
+type modelAwareFakeStore struct {
+	*fakeStore
+	setCalls     int
+	enqueueCalls int
+	model        string
+	dims         int
+	upgrade      store.EmbedModelUpgradeResult
+	setErr       error
+	enqueueErr   error
+}
+
+func (fake *modelAwareFakeStore) AdoptActiveEmbedModel(_ context.Context, model string, dims int) (bool, error) {
+	fake.setCalls++
+	if fake.setErr != nil {
+		return false, fake.setErr
+	}
+	changed := fake.model != model
+	fake.model = model
+	fake.dims = dims
+	return changed, nil
+}
+
+func (fake *modelAwareFakeStore) EnqueueEmbedModelUpgradeBatch(context.Context, string, int, int) (store.EmbedModelUpgradeResult, error) {
+	fake.enqueueCalls++
+	return fake.upgrade, fake.enqueueErr
 }
 
 func (fake *fakeStore) RedriveDeadLettersWithSource(_ context.Context, ids []int64, class string, _ int, source string) ([]store.DeadLetterRedriveResult, error) {
@@ -205,6 +233,167 @@ func TestMaintainRedrivesVersionsThenAuditsAndReaps(t *testing.T) {
 	}
 	if gauge.value != 0 {
 		t.Fatalf("dead-letter gauge = %v, want 0", gauge.value)
+	}
+}
+
+func TestObserveEmbedModelDurablyStartsOneUpgradeAndDeduplicatesResponses(t *testing.T) {
+	durable := &modelAwareFakeStore{
+		fakeStore: &fakeStore{}, model: "model-v1",
+		upgrade: store.EmbedModelUpgradeResult{Enqueued: 3, HasMore: true},
+	}
+	wakes := 0
+	manager, err := New(durable, &fakeAuditor{}, Config{
+		CurrentEmbedModelVersion: "model-v1",
+		ModelUpgradeBatchSize:    3,
+		Notify:                   func() { wakes++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ObserveEmbedModel(context.Background(), "model-v2", 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.CurrentEmbedModelVersion(); got != "model-v2" {
+		t.Fatalf("CurrentEmbedModelVersion() = %q", got)
+	}
+	if durable.setCalls != 1 || durable.enqueueCalls != 1 || durable.model != "model-v2" || wakes != 1 {
+		t.Fatalf("adoption calls set=%d enqueue=%d model=%q wakes=%d", durable.setCalls, durable.enqueueCalls, durable.model, wakes)
+	}
+	if err := manager.ObserveEmbedModel(context.Background(), "model-v2", 2); err != nil {
+		t.Fatal(err)
+	}
+	if durable.setCalls != 1 || durable.enqueueCalls != 1 {
+		t.Fatalf("same-model response rescanned store: set=%d enqueue=%d", durable.setCalls, durable.enqueueCalls)
+	}
+
+	durable.enqueueErr = errors.New("sqlite unavailable")
+	if err := manager.ObserveEmbedModel(context.Background(), "model-v3", 3); err == nil {
+		t.Fatal("failed durable upgrade adoption error = nil")
+	}
+	if got := manager.CurrentEmbedModelVersion(); got != "model-v2" {
+		t.Fatalf("failed adoption changed runtime model to %q", got)
+	}
+}
+
+func TestRuntimeModelChangeRedrivesDeadLetterAndProgressivelyRequeuesImages(t *testing.T) {
+	ctx := context.Background()
+	durable, _, err := store.Open(ctx, filepath.Join(t.TempDir(), "runtime-model.sqlite"), store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	oldModel := "model-v1"
+	indexedAt := time.Now().UnixMilli()
+	imageIDs := make([]int64, 0, 3)
+	for _, path := range []string{"/runtime-a.jpg", "/runtime-b.jpg", "/runtime-c.jpg"} {
+		file, err := durable.UpsertFile(ctx, store.File{
+			Path: path, Kind: store.FileKindImage, Size: 1, MTimeNS: 1,
+			Generation: 1, Status: store.FileStatusIndexed,
+			EmbedModelVersion: &oldModel, IndexedAtMS: &indexedAt,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		imageIDs = append(imageIDs, file.ID)
+	}
+	failed, err := durable.UpsertFile(ctx, store.File{
+		Path: "/runtime-dead.jpg", Kind: store.FileKindImage, Size: 1, MTimeNS: 1,
+		Generation: 1, Status: store.FileStatusPending,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := durable.Enqueue(ctx, store.EnqueueParams{
+		FileID: &failed.ID, Path: failed.Path, Op: store.TaskOpUpsert, Generation: failed.Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := durable.ClaimFresh(ctx, 1, time.Now()); err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimFresh() = %+v, %v", claimed, err)
+	}
+	if err := durable.MarkDead(ctx, queued.Task.ID, store.DeadLetterInfo{
+		Stage: "embed", ErrorClass: "permanent", ErrorChain: `[]`, AttemptsLog: `[]`,
+		EmbedModelVersion: &oldModel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var wakes atomic.Int64
+	manager, err := New(durable, &fakeAuditor{}, Config{
+		CurrentEmbedModelVersion: oldModel,
+		ModelUpgradeBatchSize:    1,
+		ModelUpgradeInterval:     5 * time.Millisecond,
+		SweepInterval:            time.Hour,
+		Notify:                   func() { wakes.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	group := new(errgroup.Group)
+	group.Go(func() error {
+		done <- manager.Run(runCtx)
+		return nil
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := durable.GetMeta(ctx, "clean_shutdown"); err == nil || !errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("manager did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := manager.ObserveEmbedModel(ctx, "model-v2", 2); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	for {
+		pending := 0
+		for _, fileID := range imageIDs {
+			file, getErr := durable.GetFileByID(ctx, fileID)
+			if getErr != nil {
+				cancel()
+				t.Fatal(getErr)
+			}
+			if file.Status == store.FileStatusIndexed && file.Generation == 2 && file.IndexedAtMS == nil {
+				pending++
+			}
+		}
+		_, deadErr := durable.GetDeadLetter(ctx, failed.ID)
+		failedFile, getErr := durable.GetFileByID(ctx, failed.ID)
+		if pending == len(imageIDs) && errors.Is(deadErr, store.ErrNotFound) && getErr == nil && failedFile.Status == store.FileStatusPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("runtime upgrade did not converge: images=%d deadErr=%v failed=%+v", pending, deadErr, failedFile)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if active, err := durable.ActiveEmbedModelVersion(ctx); err != nil || active != "model-v2" {
+		cancel()
+		t.Fatalf("active model = %q, %v", active, err)
+	}
+	if wakes.Load() < 2 {
+		cancel()
+		t.Fatalf("scheduler wakes = %d", wakes.Load())
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manager did not stop")
+	}
+	if err := group.Wait(); err != nil {
+		t.Fatal(err)
 	}
 }
 

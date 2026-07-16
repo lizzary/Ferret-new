@@ -20,8 +20,10 @@ import (
 	"github.com/lizzary/index-node/internal/index"
 	"github.com/lizzary/index-node/internal/instance"
 	"github.com/lizzary/index-node/internal/obs"
+	"github.com/lizzary/index-node/internal/pipeline/embed"
 	"github.com/lizzary/index-node/internal/pipeline/extract"
 	"github.com/lizzary/index-node/internal/pipeline/iostage"
+	"github.com/lizzary/index-node/internal/pipeline/media"
 	"github.com/lizzary/index-node/internal/pipeline/worker"
 	"github.com/lizzary/index-node/internal/reconcile"
 	"github.com/lizzary/index-node/internal/reliability"
@@ -29,6 +31,8 @@ import (
 	"github.com/lizzary/index-node/internal/store"
 	"github.com/lizzary/index-node/internal/watch"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -42,7 +46,8 @@ var ErrComponentsLive = errors.New("lifecycle: components remain live after shut
 // RunOptions configures optional lifecycle integrations. LogWriter receives a
 // copy of each node-local JSON log record without replacing the rotating log.
 type RunOptions struct {
-	LogWriter io.Writer
+	LogWriter        io.Writer
+	ComputeTransport embed.Transport
 }
 
 // Run assembles the M1 text path and owns its strict reverse-order shutdown.
@@ -116,10 +121,6 @@ func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions)
 		slog.Int64("tasks_requeued", recovery.Requeued),
 		slog.Int64("tasks_poisoned", recovery.Poisoned),
 	)
-	if err := durableStore.SetRuntimeVersions(ctx, extract.PlaintextExtractorVersion, ""); err != nil {
-		return fmt.Errorf("lifecycle: persist active pipeline versions: %w", err)
-	}
-
 	engine, err := index.OpenTantivy(filepath.Join(cfg.DataDir, "tantivy"))
 	if err != nil {
 		return fmt.Errorf("lifecycle: open Tantivy: %w", err)
@@ -138,6 +139,41 @@ func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions)
 	if recovery.Poisoned != 0 {
 		metrics.DeadLettersTotal.Add(float64(recovery.Poisoned))
 	}
+	vectorProjection, vectorRecovery, err := index.OpenVectorIndex(ctx, durableStore, index.VectorIndexConfig{
+		M: cfg.Index.Vector.M, EFConstruction: cfg.Index.Vector.EFConstruction,
+		EFSearch:         cfg.Index.Vector.EFSearch,
+		SnapshotPath:     filepath.Join(cfg.DataDir, "vector.snapshot"),
+		SnapshotInterval: cfg.Index.Vector.SnapshotInterval,
+		SnapshotChanges:  cfg.Index.Vector.SnapshotChanges,
+		OnStats: func(size int, tombstoneRatio float64) {
+			metrics.VectorIndexSize.Set(float64(size))
+			metrics.VectorTombstoneRatio.Set(tombstoneRatio)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("lifecycle: open vector index: %w", err)
+	}
+	logger.InfoContext(ctx, "vector index opened",
+		slog.Bool("snapshot_imported", vectorRecovery.ImportedSnapshot),
+		slog.Bool("rebuilt", vectorRecovery.Rebuilt),
+		slog.Int("delta_replayed", vectorRecovery.Replayed),
+		slog.Int64("revision", vectorRecovery.Revision),
+		slog.String("model_version", vectorRecovery.ModelVersion),
+		slog.Int("dimensions", vectorRecovery.Dimensions),
+	)
+	activeEmbedModel, err := durableStore.ActiveEmbedModelVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("lifecycle: load active embed model version: %w", err)
+	}
+	if activeEmbedModel == "" {
+		// A pre-M5 database may only have model provenance in vector truth. Use
+		// that once as a bootstrap; thereafter the successful compute handshake
+		// persisted in meta remains authoritative across partial migrations.
+		activeEmbedModel = vectorProjection.ModelVersion()
+	}
+	if err := durableStore.SetRuntimeVersions(ctx, extract.PlaintextExtractorVersion, activeEmbedModel); err != nil {
+		return fmt.Errorf("lifecycle: persist active pipeline versions: %w", err)
+	}
 
 	retryPolicy, err := errclass.NewPolicy(cfg.Retry.Base, cfg.Retry.Cap, cfg.Retry.MaxAttemptsTransient, nil)
 	if err != nil {
@@ -151,6 +187,13 @@ func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions)
 		return fmt.Errorf("lifecycle: configure IO stage: %w", err)
 	}
 	registry := extract.NewRegistry(extract.WithMaxExtractBytes(cfg.Pipeline.MaxExtractBytes))
+	imageProcessor, err := media.NewImageProcessor(media.ImageConfig{
+		Size: cfg.Pipeline.ImageSize, JPEGQuality: cfg.Pipeline.ImageJPEGQuality,
+		MaxPixels: cfg.Pipeline.ImageMaxPixels, BytesInflight: cfg.Pipeline.ImageBytesInflight,
+	})
+	if err != nil {
+		return fmt.Errorf("lifecycle: configure image processor: %w", err)
+	}
 	recorder := worker.StoreCommitRecorder{Store: durableStore}
 	var watchManager *watch.Manager
 	commitWriter, err := index.NewCommitWriter(engine, durableStore, recorder, index.CommitWriterConfig{
@@ -167,12 +210,36 @@ func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions)
 	if err != nil {
 		return fmt.Errorf("lifecycle: configure scheduler: %w", err)
 	}
+	computeTransport := options.ComputeTransport
+	if computeTransport == nil {
+		computeTransport, err = embed.NewGRPCTransport(cfg.Compute.Endpoint, cfg.Compute.RequestTimeout)
+		if err != nil {
+			return fmt.Errorf("lifecycle: configure compute transport: %w", err)
+		}
+	}
+	embeddingClosed := false
+	defer func() {
+		if !embeddingClosed && !abandonResources {
+			returnErr = errors.Join(returnErr, computeTransport.Close())
+		}
+	}()
+	embedController, err := embed.NewController(durableStore, embed.Config{
+		Failures: cfg.Compute.Breaker.Failures, OpenFor: cfg.Compute.Breaker.OpenFor,
+		Notify: taskScheduler.Wake, IsFailure: isComputeDependencyFailure,
+		OnTransition: func(transition embed.Transition) {
+			metrics.BreakerState.WithLabelValues("compute").Set(float64(transition.To))
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("lifecycle: configure embed controller: %w", err)
+	}
 	reliabilityManager, err := reliability.New(durableStore, auditor, reliability.Config{
-		Retention:               time.Duration(cfg.DeadLetter.RetentionDays) * 24 * time.Hour,
-		CurrentExtractorVersion: extract.PlaintextExtractorVersion,
-		Notify:                  taskScheduler.Wake,
-		DeadLettersSize:         metrics.DeadLettersSize,
-		AuditFlushTimeout:       shutdownTimeout,
+		Retention:                time.Duration(cfg.DeadLetter.RetentionDays) * 24 * time.Hour,
+		CurrentExtractorVersion:  extract.PlaintextExtractorVersion,
+		CurrentEmbedModelVersion: activeEmbedModel,
+		Notify:                   taskScheduler.Wake,
+		DeadLettersSize:          metrics.DeadLettersSize,
+		AuditFlushTimeout:        shutdownTimeout,
 		EnsureDeadLetterProjection: func(projectionCtx context.Context, dead store.DeadLetter) error {
 			return ensureDeadLetterProjection(projectionCtx, durableStore, commitWriter, engine, dead)
 		},
@@ -180,14 +247,42 @@ func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions)
 	if err != nil {
 		return fmt.Errorf("lifecycle: configure reliability manager: %w", err)
 	}
+	embedBatcher, err := embed.NewBatcher(computeTransport, embedController, embed.BatcherConfig{
+		BatchSize: cfg.Compute.BatchSize, BatchLinger: cfg.Compute.BatchLinger,
+		InflightBatches: cfg.Compute.InflightBatches,
+		OnModel: func(modelCtx context.Context, info embed.ModelInfo) error {
+			if err := reliabilityManager.ObserveEmbedModel(modelCtx, info.Version, info.Dims); err != nil {
+				if errors.Is(err, store.ErrEmbedModelContract) {
+					return &embed.ResponseError{Problem: err.Error()}
+				}
+				return err
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("lifecycle: configure embed batcher: %w", err)
+	}
 	processor, err := worker.New(durableStore, ioStage, registry, commitWriter, engine, worker.Config{
 		Workers: processorConcurrency(cfg.Pipeline.CPUPercentCap), RetryPolicy: retryPolicy,
 		CommitTimeout: shutdownTimeout, Observer: worker.MetricsObserver{Metrics: metrics},
-		DeadLetterRecorder: reliabilityManager,
-		ExtractorVersion:   extract.PlaintextExtractorVersion,
+		DeadLetterRecorder:       reliabilityManager,
+		ExtractorVersion:         extract.PlaintextExtractorVersion,
+		EmbedModelVersion:        activeEmbedModel,
+		CurrentEmbedModelVersion: reliabilityManager.CurrentEmbedModelVersion,
+		ImageProcessor:           imageProcessor,
+		ImageEmbedder:            embedBatcher,
+		VectorProjector:          vectorProjection,
 	})
 	if err != nil {
 		return fmt.Errorf("lifecycle: configure pipeline processor: %w", err)
+	}
+	backfilled, err := enqueueLegacyImages(ctx, durableStore, imageProcessor, 0, taskScheduler.Wake)
+	if err != nil {
+		return err
+	}
+	if backfilled != 0 {
+		logger.InfoContext(ctx, "legacy images enqueued for M5 backfill", slog.Int("files", backfilled))
 	}
 	reconciler, err := reconcile.New(
 		durableStore,
@@ -299,6 +394,9 @@ func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions)
 	tree := componentTree{
 		leases: leases, timeout: shutdownTimeout,
 		writer:      commitWriter.Run,
+		vector:      vectorProjection.Run,
+		controller:  embedController.Run,
+		batcher:     embedBatcher.Run,
 		processor:   func(runCtx context.Context) error { return processor.Run(runCtx, leases) },
 		reliability: reliabilityManager.Run,
 		scheduler:   taskScheduler.Run,
@@ -317,6 +415,10 @@ func RunWithOptions(ctx context.Context, cfg *config.Config, options RunOptions)
 				return errors.Join(err, metricsServer.Close())
 			}
 			return nil
+		},
+		closeEmbedding: func() error {
+			embeddingClosed = true
+			return embedBatcher.Close()
 		},
 		closeProjection: func() error {
 			projectionClosed = true
@@ -353,6 +455,28 @@ func mapWatchChange(change watch.RawChange) (debounce.RawChange, error) {
 		return debounce.RawChange{}, fmt.Errorf("lifecycle: unknown watch operation %d", change.Op)
 	}
 	return normalized, nil
+}
+
+// isComputeDependencyFailure distinguishes reachability/availability failures
+// from a malformed but reachable compute response. Only the former opens the
+// breaker and parks durable work; response contract violations flow back to
+// the worker as permanent embed failures.
+func isComputeDependencyFailure(err error) bool {
+	if err == nil || errors.Is(err, embed.ErrInvalidResponse) || errors.Is(err, embed.ErrStaleModelResponse) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	case codes.Canceled, codes.InvalidArgument, codes.FailedPrecondition,
+		codes.OutOfRange, codes.Unimplemented:
+		return false
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
 }
 
 type healthResponse struct {
@@ -480,6 +604,9 @@ type componentName string
 
 const (
 	componentWriter      componentName = "commit writer"
+	componentVector      componentName = "vector index"
+	componentController  componentName = "embed controller"
+	componentBatcher     componentName = "embed batcher"
 	componentProcessor   componentName = "pipeline processor"
 	componentReliability componentName = "reliability manager"
 	componentScheduler   componentName = "scheduler"
@@ -487,6 +614,7 @@ const (
 	componentWatch       componentName = "watch manager"
 	componentReconcile   componentName = "reconciler"
 	componentMetrics     componentName = "metrics server"
+	componentCount                     = 11
 )
 
 type componentExit struct {
@@ -500,6 +628,9 @@ type componentTree struct {
 	leases          chan scheduler.Lease
 	timeout         time.Duration
 	writer          func(context.Context) error
+	vector          func(context.Context) error
+	controller      func(context.Context) error
+	batcher         func(context.Context) error
 	processor       func(context.Context) error
 	reliability     func(context.Context) error
 	scheduler       func(context.Context) error
@@ -508,6 +639,7 @@ type componentTree struct {
 	reconcile       func(context.Context) error
 	metrics         func(context.Context) error
 	shutdownMetrics func(context.Context) error
+	closeEmbedding  func() error
 	closeProjection func() error
 	markClean       func(context.Context) error
 }
@@ -518,6 +650,25 @@ func (tree componentTree) run(ctx context.Context) error {
 		tree.closeProjection == nil || tree.markClean == nil {
 		return errors.New("lifecycle: incomplete component tree")
 	}
+	// Older component-order unit fixtures exercise only the M0-M4 tree. Treat
+	// omitted M5 dependencies as managed idle components; production assembly
+	// always supplies the real vector/controller/batcher functions below.
+	idle := func(componentCtx context.Context) error {
+		<-componentCtx.Done()
+		return nil
+	}
+	if tree.vector == nil {
+		tree.vector = idle
+	}
+	if tree.controller == nil {
+		tree.controller = idle
+	}
+	if tree.batcher == nil {
+		tree.batcher = idle
+	}
+	if tree.closeEmbedding == nil {
+		tree.closeEmbedding = func() error { return nil }
+	}
 	if tree.timeout <= 0 {
 		tree.timeout = shutdownTimeout
 	}
@@ -525,6 +676,12 @@ func (tree componentTree) run(ctx context.Context) error {
 	base := context.WithoutCancel(ctx)
 	writerCtx, cancelWriter := context.WithCancel(base)
 	defer cancelWriter()
+	vectorCtx, cancelVector := context.WithCancel(base)
+	defer cancelVector()
+	controllerCtx, cancelController := context.WithCancel(base)
+	defer cancelController()
+	batcherCtx, cancelBatcher := context.WithCancel(base)
+	defer cancelBatcher()
 	processorCtx, cancelProcessor := context.WithCancel(base)
 	defer cancelProcessor()
 	reliabilityCtx, cancelReliability := context.WithCancel(base)
@@ -540,7 +697,7 @@ func (tree componentTree) run(ctx context.Context) error {
 	metricsCtx, cancelMetrics := context.WithCancel(base)
 	defer cancelMetrics()
 
-	exits := make(chan componentExit, 8)
+	exits := make(chan componentExit, componentCount)
 	var group errgroup.Group
 	start := func(name componentName, runCtx context.Context, run func(context.Context) error) {
 		started := make(chan struct{})
@@ -554,6 +711,9 @@ func (tree componentTree) run(ctx context.Context) error {
 	// Registration order is an invariant: submissions can queue before the
 	// writer goroutine is scheduled, but no producer is even started first.
 	start(componentWriter, writerCtx, tree.writer)
+	start(componentVector, vectorCtx, tree.vector)
+	start(componentController, controllerCtx, tree.controller)
+	start(componentBatcher, batcherCtx, tree.batcher)
 	start(componentProcessor, processorCtx, tree.processor)
 	start(componentReliability, reliabilityCtx, tree.reliability)
 	start(componentScheduler, schedulerCtx, tree.scheduler)
@@ -562,8 +722,8 @@ func (tree componentTree) run(ctx context.Context) error {
 	start(componentReconcile, reconcileCtx, tree.reconcile)
 	start(componentMetrics, metricsCtx, tree.metrics)
 
-	expected := make(map[componentName]bool, 8)
-	exited := make(map[componentName]struct{}, 8)
+	expected := make(map[componentName]bool, componentCount)
+	exited := make(map[componentName]struct{}, componentCount)
 	var runErr error
 	record := func(result componentExit) {
 		if _, duplicate := exited[result.name]; duplicate {
@@ -630,13 +790,28 @@ func (tree componentTree) run(ctx context.Context) error {
 	} else {
 		cancelProcessor()
 	}
-	if _, writerFailedEarly := exited[componentWriter]; writerFailedEarly && !expected[componentWriter] {
+	_, writerFailedEarly := exited[componentWriter]
+	_, vectorFailedEarly := exited[componentVector]
+	_, controllerFailedEarly := exited[componentController]
+	_, batcherFailedEarly := exited[componentBatcher]
+	if (writerFailedEarly && !expected[componentWriter]) ||
+		(vectorFailedEarly && !expected[componentVector]) ||
+		(controllerFailedEarly && !expected[componentController]) ||
+		(batcherFailedEarly && !expected[componentBatcher]) {
 		cancelProcessor()
 	}
 	processorStopped := await(componentProcessor)
 	if !processorStopped {
 		cancelProcessor()
 	}
+
+	expected[componentBatcher] = true
+	cancelBatcher()
+	batcherStopped := await(componentBatcher)
+
+	expected[componentController] = true
+	cancelController()
+	controllerStopped := await(componentController)
 
 	// The processor may create a final dead letter while draining its last
 	// lease. Stop reliability only afterward so its cancellation path can flush
@@ -649,10 +824,17 @@ func (tree componentTree) run(ctx context.Context) error {
 	cancelWriter()
 	writerStopped := await(componentWriter)
 
+	expected[componentVector] = true
+	cancelVector()
+	vectorStopped := await(componentVector)
+
 	// Projection ownership may be released only after every possible consumer
 	// has exited. On a shutdown deadline, returning an unclean error is safer
 	// than closing native state underneath a non-cooperative component.
-	if processorStopped && writerStopped {
+	if processorStopped && batcherStopped && controllerStopped && writerStopped && vectorStopped {
+		if err := tree.closeEmbedding(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("lifecycle: close embed transport: %w", err))
+		}
 		if err := tree.closeProjection(); err != nil {
 			runErr = errors.Join(runErr, fmt.Errorf("lifecycle: close projection: %w", err))
 		}
@@ -673,6 +855,9 @@ func (tree componentTree) run(ctx context.Context) error {
 	cancelWatch()
 	cancelReconcile()
 	cancelProcessor()
+	cancelBatcher()
+	cancelController()
+	cancelVector()
 	cancelWriter()
 	cancelMetrics()
 	// Every normal component exit is observed before Wait, making it bounded.

@@ -206,6 +206,74 @@ func TestWaitingDependencyWithPriorAttemptsRemainsOutsideRetrySource(t *testing.
 	}
 }
 
+func TestMarkWaitingDepBatchIsAtomicAndRefundsEveryLease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	durable := openTestStore(t, filepath.Join(t.TempDir(), "waiting-batch.sqlite"))
+	ids := make([]int64, 0, 2)
+	for _, path := range []string{"/batch-a.jpg", "/batch-b.jpg"} {
+		queued, err := durable.Enqueue(ctx, EnqueueParams{Path: path, Op: TaskOpUpsert, Generation: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, queued.Task.ID)
+	}
+	claimed, err := durable.ClaimFresh(ctx, 2, time.Now())
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("ClaimFresh() = %+v, %v", claimed, err)
+	}
+	if err := durable.MarkWaitingDepBatch(ctx, ids, "compute offline"); err != nil {
+		t.Fatalf("MarkWaitingDepBatch() = %v", err)
+	}
+	for _, taskID := range ids {
+		task, err := durable.GetTask(ctx, taskID)
+		if err != nil || task.State != TaskStateWaitingDep || task.Attempts != 0 {
+			t.Fatalf("parked task %d = %+v, %v", taskID, task, err)
+		}
+	}
+	if released, err := durable.ReleaseWaitingDep(ctx, 2); err != nil || released != 2 {
+		t.Fatalf("ReleaseWaitingDep() = %d, %v", released, err)
+	}
+	claimed, err = durable.ClaimFresh(ctx, 2, time.Now())
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("free ClaimFresh() = %+v, %v", claimed, err)
+	}
+	for _, task := range claimed {
+		if task.Attempts != 0 {
+			t.Fatalf("task %d attempts = %d, want 0", task.ID, task.Attempts)
+		}
+	}
+}
+
+func TestMarkWaitingDepBatchRollsBackOnAnyInvalidTask(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	durable := openTestStore(t, filepath.Join(t.TempDir(), "waiting-batch-rollback.sqlite"))
+	first, err := durable.Enqueue(ctx, EnqueueParams{Path: "/rollback-a.jpg", Op: TaskOpUpsert, Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := durable.Enqueue(ctx, EnqueueParams{Path: "/rollback-b.jpg", Op: TaskOpUpsert, Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := durable.ClaimFresh(ctx, 1, time.Now())
+	if err != nil || len(claimed) != 1 || claimed[0].ID != first.Task.ID {
+		t.Fatalf("ClaimFresh() = %+v, %v", claimed, err)
+	}
+	if err := durable.MarkWaitingDepBatch(ctx, []int64{first.Task.ID, second.Task.ID}, "offline"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("MarkWaitingDepBatch() = %v", err)
+	}
+	currentFirst, err := durable.GetTask(ctx, first.Task.ID)
+	if err != nil || currentFirst.State != TaskStateInFlight || currentFirst.Attempts != 1 {
+		t.Fatalf("first task after rollback = %+v, %v", currentFirst, err)
+	}
+	currentSecond, err := durable.GetTask(ctx, second.Task.ID)
+	if err != nil || currentSecond.State != TaskStatePending || currentSecond.Attempts != 0 {
+		t.Fatalf("second task after rollback = %+v, %v", currentSecond, err)
+	}
+}
+
 func TestClaimFreshAndRetryUseDisjointAtomicSources(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -470,24 +470,58 @@ func (s *Store) markRetry(ctx context.Context, taskID int64, nextAttempt time.Ti
 }
 
 func (s *Store) MarkWaitingDep(ctx context.Context, taskID int64, lastError string) error {
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		task, err := taskForTransition(ctx, tx, taskID, TaskStateInFlight)
-		if err != nil {
-			return err
+	return s.MarkWaitingDepBatch(ctx, []int64{taskID}, lastError)
+}
+
+// MarkWaitingDepBatch atomically parks every in-flight task represented by one
+// embedding RPC. Validation is intentionally completed before the first row is
+// changed, and the surrounding transaction rolls back all prior changes if a
+// later transition or state-slot cleanup fails.
+func (s *Store) MarkWaitingDepBatch(ctx context.Context, taskIDs []int64, lastError string) error {
+	if len(taskIDs) == 0 {
+		return errors.New("store: dependency batch is empty")
+	}
+	seen := make(map[int64]struct{}, len(taskIDs))
+	for _, taskID := range taskIDs {
+		if taskID <= 0 {
+			return fmt.Errorf("store: dependency batch contains invalid task id %d", taskID)
 		}
-		if err := clearOlderStateSlot(ctx, tx, task, TaskStateWaitingDep); err != nil {
-			return err
+		if _, exists := seen[taskID]; exists {
+			return fmt.Errorf("store: dependency batch contains duplicate task id %d", taskID)
+		}
+		seen[taskID] = struct{}{}
+	}
+
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		tasks := make([]Task, len(taskIDs))
+		for index, taskID := range taskIDs {
+			task, err := taskForTransition(ctx, tx, taskID, TaskStateInFlight)
+			if err != nil {
+				return err
+			}
+			tasks[index] = task
+		}
+		for _, task := range tasks {
+			if err := clearOlderStateSlot(ctx, tx, task, TaskStateWaitingDep); err != nil {
+				return err
+			}
 		}
 		// Refund only a charged lease, then persist a free next lease. Repeated
 		// dependency outages therefore leave attempts unchanged across release,
 		// re-claim, and re-park cycles, including process restarts.
-		result, err := tx.ExecContext(ctx, `
-			UPDATE tasks SET state='waiting_dep',attempts=MAX(attempts-claim_attempt_charge,0),claim_attempt_charge=0,last_error=?,updated_at=?
-			WHERE task_id=? AND state='in_flight'`, lastError, time.Now().UnixMilli(), taskID)
-		if err != nil {
-			return fmt.Errorf("store: park task %d for dependency: %w", taskID, err)
+		now := time.Now().UnixMilli()
+		for _, taskID := range taskIDs {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE tasks SET state='waiting_dep',attempts=MAX(attempts-claim_attempt_charge,0),claim_attempt_charge=0,last_error=?,updated_at=?
+				WHERE task_id=? AND state='in_flight'`, lastError, now, taskID)
+			if err != nil {
+				return fmt.Errorf("store: park task %d for dependency: %w", taskID, err)
+			}
+			if err := requireChanged(result); err != nil {
+				return fmt.Errorf("store: park task %d for dependency: %w", taskID, err)
+			}
 		}
-		return requireChanged(result)
+		return nil
 	})
 }
 

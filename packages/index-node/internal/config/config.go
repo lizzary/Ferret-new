@@ -77,6 +77,7 @@ type WatchRoot struct {
 
 type ComputeConfig struct {
 	Endpoint        string        `yaml:"endpoint"`
+	RequestTimeout  time.Duration `yaml:"request_timeout"`
 	BatchSize       int           `yaml:"batch_size"`
 	BatchLinger     time.Duration `yaml:"batch_linger"`
 	InflightBatches int           `yaml:"inflight_batches"`
@@ -89,13 +90,17 @@ type BreakerConfig struct {
 }
 
 type PipelineConfig struct {
-	IOConcurrency   int    `yaml:"io_concurrency"`
-	IOBytesInflight int64  `yaml:"io_bytes_inflight"`
-	CPUPercentCap   int    `yaml:"cpu_percent_cap"`
-	MaxFileSize     int64  `yaml:"max_file_size"`
-	MaxExtractBytes int64  `yaml:"max_extract_bytes"`
-	VideoFrames     int    `yaml:"video_frames"`
-	FFmpegPath      string `yaml:"ffmpeg_path"`
+	IOConcurrency      int    `yaml:"io_concurrency"`
+	IOBytesInflight    int64  `yaml:"io_bytes_inflight"`
+	CPUPercentCap      int    `yaml:"cpu_percent_cap"`
+	MaxFileSize        int64  `yaml:"max_file_size"`
+	MaxExtractBytes    int64  `yaml:"max_extract_bytes"`
+	ImageSize          int    `yaml:"image_size"`
+	ImageJPEGQuality   int    `yaml:"image_jpeg_quality"`
+	ImageMaxPixels     int64  `yaml:"image_max_pixels"`
+	ImageBytesInflight int64  `yaml:"image_bytes_inflight"`
+	VideoFrames        int    `yaml:"video_frames"`
+	FFmpegPath         string `yaml:"ffmpeg_path"`
 }
 
 type IndexConfig struct {
@@ -109,6 +114,7 @@ type VectorConfig struct {
 	EFConstruction   int           `yaml:"ef_construction"`
 	EFSearch         int           `yaml:"ef_search"`
 	SnapshotInterval time.Duration `yaml:"snapshot_interval"`
+	SnapshotChanges  int           `yaml:"snapshot_changes"`
 }
 
 type RetryConfig struct {
@@ -154,6 +160,7 @@ func Default() Config {
 		},
 		Compute: ComputeConfig{
 			Endpoint:        "dns:///compute:7801",
+			RequestTimeout:  30 * time.Second,
 			BatchSize:       32,
 			BatchLinger:     100 * time.Millisecond,
 			InflightBatches: 8,
@@ -163,13 +170,17 @@ func Default() Config {
 			},
 		},
 		Pipeline: PipelineConfig{
-			IOConcurrency:   0,
-			IOBytesInflight: 256 << 20,
-			CPUPercentCap:   50,
-			MaxFileSize:     512 << 20,
-			MaxExtractBytes: 2 << 20,
-			VideoFrames:     5,
-			FFmpegPath:      "ffmpeg",
+			IOConcurrency:      0,
+			IOBytesInflight:    256 << 20,
+			CPUPercentCap:      50,
+			MaxFileSize:        512 << 20,
+			MaxExtractBytes:    2 << 20,
+			ImageSize:          384,
+			ImageJPEGQuality:   90,
+			ImageMaxPixels:     25_000_000,
+			ImageBytesInflight: 256 << 20,
+			VideoFrames:        5,
+			FFmpegPath:         "ffmpeg",
 		},
 		Index: IndexConfig{
 			CommitMaxOps:   1000,
@@ -179,6 +190,7 @@ func Default() Config {
 				EFConstruction:   200,
 				EFSearch:         64,
 				SnapshotInterval: 10 * time.Minute,
+				SnapshotChanges:  5000,
 			},
 		},
 		Retry: RetryConfig{
@@ -293,6 +305,7 @@ func (c Config) Validate() error {
 
 	add(strings.TrimSpace(c.Compute.Endpoint) == "", "compute.endpoint must not be empty")
 	add(strings.ContainsRune(c.Compute.Endpoint, 0), "compute.endpoint must not contain NUL")
+	add(c.Compute.RequestTimeout <= 0, "compute.request_timeout must be greater than 0")
 	add(c.Compute.BatchSize <= 0, "compute.batch_size must be greater than 0")
 	add(c.Compute.BatchLinger <= 0, "compute.batch_linger must be greater than 0")
 	add(c.Compute.InflightBatches <= 0, "compute.inflight_batches must be greater than 0")
@@ -304,6 +317,15 @@ func (c Config) Validate() error {
 	add(c.Pipeline.CPUPercentCap < 1 || c.Pipeline.CPUPercentCap > 100, "pipeline.cpu_percent_cap must be between 1 and 100")
 	add(c.Pipeline.MaxFileSize <= 0, "pipeline.max_file_size must be greater than 0")
 	add(c.Pipeline.MaxExtractBytes <= 0, "pipeline.max_extract_bytes must be greater than 0")
+	add(c.Pipeline.ImageSize <= 0, "pipeline.image_size must be greater than 0")
+	add(c.Pipeline.ImageJPEGQuality < 1 || c.Pipeline.ImageJPEGQuality > 100, "pipeline.image_jpeg_quality must be between 1 and 100")
+	add(c.Pipeline.ImageMaxPixels <= 0, "pipeline.image_max_pixels must be greater than 0")
+	add(c.Pipeline.ImageMaxPixels > math.MaxInt64/4, "pipeline.image_max_pixels is too large")
+	add(c.Pipeline.ImageBytesInflight <= 0, "pipeline.image_bytes_inflight must be greater than 0")
+	if c.Pipeline.ImageMaxPixels > 0 && c.Pipeline.ImageMaxPixels <= math.MaxInt64/4 {
+		add(c.Pipeline.ImageBytesInflight < c.Pipeline.ImageMaxPixels*4,
+			"pipeline.image_bytes_inflight must be at least pipeline.image_max_pixels * 4")
+	}
 	add(c.Pipeline.VideoFrames <= 0 || c.Pipeline.VideoFrames >= 1<<16, "pipeline.video_frames must be between 1 and 65535")
 	add(strings.ContainsRune(c.Pipeline.FFmpegPath, 0), "pipeline.ffmpeg_path must not contain NUL")
 
@@ -313,6 +335,7 @@ func (c Config) Validate() error {
 	add(c.Index.Vector.EFConstruction < c.Index.Vector.M, "index.vector.ef_construction must be at least index.vector.m")
 	add(c.Index.Vector.EFSearch <= 0, "index.vector.ef_search must be greater than 0")
 	add(c.Index.Vector.SnapshotInterval <= 0, "index.vector.snapshot_interval must be greater than 0")
+	add(c.Index.Vector.SnapshotChanges <= 0, "index.vector.snapshot_changes must be greater than 0")
 
 	add(c.Retry.Base <= 0, "retry.base must be greater than 0")
 	add(c.Retry.Cap < c.Retry.Base, "retry.cap must be greater than or equal to retry.base")

@@ -1,6 +1,6 @@
 # Index-node progress
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## M0 - skeleton (complete)
 
@@ -145,7 +145,41 @@ Last updated: 2026-07-14
 - Bubble Tea `/enqueue`, `/search`, and `/deadletters` require the lifecycle to be stopped. M8 replaces these owner-locked maintenance paths with the in-process gRPC control plane.
 - The workspace still has an empty/non-functional parent `.git` directory, so local validation uses `-buildvcs=false`.
 
-## Bubble Tea terminal shell - M0-M4 surface
+## M5 - still-image semantic indexing (complete)
+
+### Completed
+
+- Added panic-isolated JPEG/PNG/GIF still-image processing with signature detection, pre-decode pixel limits, a shared decoded-byte budget, EXIF orientations 1-8, alpha-on-white composition, centered crop/resize, normalized JPEG output, and first-frame GIF semantics.
+- Defined the checked-in `ferret.compute.v1.EmbedService` protobuf contract and generated Go bindings. Added the real gRPC transport with per-request deadlines plus strict cardinality, dimensions, model-version, finite-value, non-zero-norm, defensive-copy, and L2-normalization checks.
+- Added task-preserving micro-batches (32 images or 100 ms by default), an eight-batch shared in-flight limit, query-side breaker probes, and transactionally atomic whole-batch `waiting_dep` parking with zero attempt growth.
+- Made SQLite vectors the durable truth and added an append-only change revision log so snapshot recovery can replay replacements and deletions. Added the single-writer `coder/hnsw` projection, packed `(file_id << 16) | frame_idx` keys, tombstones, 20% side-build/swap compaction, checksummed atomic snapshots, strict delta replay, and full-rebuild fallbacks.
+- Added a durable `(model_version, dims)` handshake, ordered concurrent model observations, runtime dead-letter provenance, and bounded generation-fenced re-embedding when compute changes model. Keyword documents remain available while old images converge into the new single-model graph.
+- Added keyword, semantic, and hybrid search with concurrent routes, catalog-authoritative path/kind/mtime/status/generation/model filtering, geometrically expanded bounded candidates, explicit incomplete-result reporting, failed-file filename/path safety, exact RRF `1/(60+rank)`, file deduplication, source labels, and best-frame propagation.
+- Integrated image extraction, embed, vector replace/delete, generation fences, stage-specific classification, and reverse-order shutdown into the production worker/lifecycle. Added a crash-resumable, idempotent backfill for pre-M5 images previously cataloged as `kind=other`.
+- Extended the stopped-node Bubble Tea `/search` command with hybrid default, keyword/semantic modes, top-K and catalog filters, source/frame/snippet output, and explicit degraded/incomplete notices.
+- Added a deterministic real-gRPC M5 acceptance test covering semantic ranking, compute-off hybrid degradation, and restart recovery from SQLite/snapshot, plus normal/race regressions for media, batching, breaker state, model upgrades, search filtering, HNSW gaps, worker ordering, maintenance, and lifecycle wiring.
+- Recorded the HNSW snapshot/change-log/Windows compatibility boundary in ADR 0006 and the implementation incidents and final consistency model in `docs/m5-development-bug-log.md`.
+
+### Validation
+
+- `go test -buildvcs=false -count=1 ./...` passes across all 23 packages, including the deterministic real-gRPC M5 acceptance, 1000-file idempotence, crash re-exec, runtime model upgrade, dimension-drift, dispatch-epoch, filtered-rank, snapshot-gap, and stopped-maintenance regressions.
+- `go test -buildvcs=false -race -count=1 ./...` passes with no data races.
+- `go vet -buildvcs=false ./...` and `go build -buildvcs=false ./cmd/indexnode` pass.
+- Required coverage thresholds pass: `internal/store` 80.3%, `internal/debounce` 90.6%, `internal/errclass` 97.2%, and `internal/scheduler` 90.8%.
+- `go mod tidy -diff` is empty, checked-in protobuf regeneration is byte-stable, `git diff --check` passes, and all 53 changed/new Go files are `gofmt` clean.
+- Final Tantivy-backed normal/race gates used the Windows system temporary directory. Workspace-local TEMP reproducibly caused native writer `AccessDenied` retries and was retained only as an environment-diagnostic regression in the M5 fault retrospective.
+- The final P0/P1 read-only review is clean: dispatch epochs, durable model/dimension contracts, stale-response isolation, bounded re-embedding, and error classification have no remaining blockers.
+
+### Known issues
+
+- M5 handles JPEG, PNG, and the first frame of GIF. Video probing, sampling, multi-frame vectors, and `frame_ts_ms` extraction arrive in M6.
+- Semantic indexing/search requires a compatible compute endpoint. Keyword search does not initialize compute or HNSW; hybrid mode explicitly degrades to keyword results when compute is unavailable or a newly observed model is still converging.
+- A new compute model is observable only after a successful RPC. Re-embedding is bounded and durable rather than instantaneous, and M8 has not yet added an administrative migration-progress surface.
+- Catalog filters expand backend candidates to a hard limit of 1000. When that limit prevents proving completeness, the response and terminal output explicitly mark results incomplete.
+- The Bubble Tea `/search` path remains stopped-node maintenance protected by the data-directory owner lock. M8 replaces it with the live gRPC query/control plane.
+- The pinned HNSW version needs a narrow local `renameio` compatibility module on Windows. Any dependency upgrade must re-audit Import/Export, same-key replacement, construction EF, and atomic replacement before removing it.
+
+## Bubble Tea terminal shell - M0-M5 surface
 
 ### Completed
 
@@ -154,9 +188,9 @@ Last updated: 2026-07-14
 - Reused Artifex's production Frame Crab ANSI mascot, responsive panel geometry, dark/light palette, prompt, command suggestions, and full-screen log controls without substituting Bubbles widgets.
 - Bridged the rotating local JSON logger to a bounded in-memory TUI log hub without redirecting lifecycle logs through stdout or changing local path-retention semantics.
 - Connected lifecycle start, strict stop, restart, health polling, resolved configuration display/load/reload, persisted terminal theme, and clean `/quit`/`Ctrl+C` shutdown. `INDEXNODE_CONFIG` selects the first-launch/headless startup YAML; while stopped, `/config load <path>` atomically selects a new session source and `/config reload` rereads the current source. Failure preserves both the prior resolved configuration and source, and the TUI never rewrites YAML.
-- Exposed enqueue, keyword-search, and dead-letter maintenance only as stopped-node slash commands. Removed their executable JSON compatibility forms instead of maintaining a second command parser and output contract.
+- Exposed enqueue, hybrid/keyword/semantic search, and dead-letter maintenance only as stopped-node slash commands. Removed their executable JSON compatibility forms instead of maintaining a second command parser and output contract.
 - Preflights Tantivy before Bubble Tea owns the terminal so the v1.0.6 binding's one-time stdout debug line cannot corrupt renderer coordinates; prompt input now uses Bubble Tea's real cursor with width-bounded home/log rows.
-- Kept later capabilities explicitly staged: live maintenance/dynamic administration and rescan/reindex remain M8 work; semantic/media, video, notes, and complete observability remain attached to their original milestones.
+- Kept later capabilities explicitly staged: video remains M6, notes remain M7, live maintenance/dynamic administration and rescan/reindex remain M8, and complete observability remains M9 work.
 
 ### Boundary
 
@@ -172,4 +206,4 @@ Last updated: 2026-07-14
 
 ## Next
 
-M5: add image/media extraction, the micro-batched embed client and breaker integration, vector persistence and HNSW recovery, semantic/hybrid search, and RRF ranking.
+M6: add ffprobe/ffmpeg video discovery and sampling, multi-frame embeddings, per-frame durable vectors, and semantic results carrying the correct `frame_ts_ms`.

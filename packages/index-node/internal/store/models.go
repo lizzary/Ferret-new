@@ -226,6 +226,27 @@ type Vector struct {
 	ModelVersion string
 }
 
+type VectorChangeOp string
+
+const (
+	VectorChangeUpsert VectorChangeOp = "upsert"
+	VectorChangeDelete VectorChangeOp = "delete"
+)
+
+// VectorChange is the durable projection-recovery stream emitted by SQLite
+// triggers whenever vector truth is inserted, replaced, or removed. Revision
+// is strictly increasing and is the watermark stored in vector snapshots.
+type VectorChange struct {
+	Revision     int64
+	FileID       int64
+	FrameIndex   int
+	Op           VectorChangeOp
+	FrameTSMS    *int64
+	Values       []float32
+	ModelVersion string
+	ChangedAtMS  int64
+}
+
 type RecoveryResult struct {
 	Crashed             bool
 	Requeued            int64

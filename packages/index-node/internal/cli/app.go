@@ -712,7 +712,7 @@ func (m *model) stoppedOperationBlocked(operation string) bool {
 }
 
 func activeMaintenanceMessage(operation string) string {
-	return operation + " cannot run while the lifecycle is active: M4 maintenance commands require exclusive data-directory ownership. Use /stop first; online administration arrives with the M8 control plane."
+	return operation + " cannot run while the lifecycle is active: stopped-node maintenance requires exclusive data-directory ownership. Use /stop first; online administration arrives with the M8 control plane."
 }
 
 // splitCommandLine preserves backslashes in Windows paths while grouping
@@ -893,7 +893,7 @@ func (m *model) homeActionLines() []string {
 		)
 	}
 	return append(lines,
-		p.secondaryStyle().Render("/start run the M0-M4 node lifecycle"),
+		p.secondaryStyle().Render("/start run the M0-M5 node lifecycle"),
 		p.secondaryStyle().Render("/enqueue  /search  /deadletters"),
 		p.secondaryStyle().Render("/config reload"),
 		p.secondaryStyle().Render("/config load <path>"),
@@ -1118,7 +1118,7 @@ func (m *model) configSummary() string {
 		return "No resolved node configuration is loaded."
 	}
 	lines := []string{
-		"RESOLVED CONFIGURATION · ACTIVE IN M0-M4",
+		"RESOLVED CONFIGURATION · ACTIVE IN M0-M5",
 		"source: " + displayConfigPath(m.cfg.ConfigPath),
 		"node_id: " + safeInline(cfg.NodeID),
 		"data_dir: " + safeInline(cfg.DataDir),
@@ -1136,8 +1136,24 @@ func (m *model) configSummary() string {
 		fmt.Sprintf("pipeline.cpu_percent_cap: %d", cfg.Pipeline.CPUPercentCap),
 		fmt.Sprintf("pipeline.max_file_size: %d", cfg.Pipeline.MaxFileSize),
 		fmt.Sprintf("pipeline.max_extract_bytes: %d", cfg.Pipeline.MaxExtractBytes),
+		fmt.Sprintf("pipeline.image_size: %d", cfg.Pipeline.ImageSize),
+		fmt.Sprintf("pipeline.image_jpeg_quality: %d", cfg.Pipeline.ImageJPEGQuality),
+		fmt.Sprintf("pipeline.image_max_pixels: %d", cfg.Pipeline.ImageMaxPixels),
+		fmt.Sprintf("pipeline.image_bytes_inflight: %d", cfg.Pipeline.ImageBytesInflight),
+		"compute.endpoint: "+safeInline(cfg.Compute.Endpoint),
+		"compute.request_timeout: "+cfg.Compute.RequestTimeout.String(),
+		fmt.Sprintf("compute.batch_size: %d", cfg.Compute.BatchSize),
+		"compute.batch_linger: "+cfg.Compute.BatchLinger.String(),
+		fmt.Sprintf("compute.inflight_batches: %d", cfg.Compute.InflightBatches),
+		fmt.Sprintf("compute.breaker.failures: %d", cfg.Compute.Breaker.Failures),
+		"compute.breaker.open_for: "+cfg.Compute.Breaker.OpenFor.String(),
 		fmt.Sprintf("index.commit_max_ops: %d", cfg.Index.CommitMaxOps),
 		"index.commit_interval: "+cfg.Index.CommitInterval.String(),
+		fmt.Sprintf("index.vector.m: %d", cfg.Index.Vector.M),
+		fmt.Sprintf("index.vector.ef_construction: %d", cfg.Index.Vector.EFConstruction),
+		fmt.Sprintf("index.vector.ef_search: %d", cfg.Index.Vector.EFSearch),
+		"index.vector.snapshot_interval: "+cfg.Index.Vector.SnapshotInterval.String(),
+		fmt.Sprintf("index.vector.snapshot_changes: %d", cfg.Index.Vector.SnapshotChanges),
 		"retry.base: "+cfg.Retry.Base.String(),
 		"retry.cap: "+cfg.Retry.Cap.String(),
 		fmt.Sprintf("retry.max_attempts_transient: %d", cfg.Retry.MaxAttemptsTransient),
@@ -1147,7 +1163,7 @@ func (m *model) configSummary() string {
 		"log.level: "+safeInline(cfg.Log.Level),
 		fmt.Sprintf("log.redact_paths: %t", cfg.Log.RedactPaths),
 		fmt.Sprintf("log.retain_days: %d", cfg.Log.RetainDays),
-		"Later milestones (not active here): grpc control plane, compute/embed, video, vector, notes, and resource admission.",
+		"Later milestones (not active here): video extraction, notes, grpc control plane, and complete resource admission.",
 	)
 	return strings.Join(lines, "\n")
 }
@@ -1162,7 +1178,7 @@ func (m *model) showConfiguration() string {
 		return "No resolved node configuration is loaded."
 	}
 	return fmt.Sprintf(
-		"Resolved M0-M4 config · node %s · data_dir %s · roots %d\n%d configuration lines were written to /log.",
+		"Resolved M0-M5 config · node %s · data_dir %s · roots %d\n%d configuration lines were written to /log.",
 		safeInline(m.nodeCfg.NodeID), safeInline(m.nodeCfg.DataDir), len(m.nodeCfg.Watch.Roots), len(lines),
 	)
 }
@@ -1172,14 +1188,14 @@ func (m *model) showHelp() string {
 		"/start - start the stopped node lifecycle",
 		"/stop - stop the lifecycle cleanly",
 		"/status - refresh aggregate node health",
-		"/config - show resolved M0-M4 configuration",
+		"/config - show resolved M0-M5 configuration",
 		"/config reload - reload the current source while stopped",
 		"/config load <path> - load a YAML file while stopped",
 		"/log - open logs; Esc returns home",
 		"/home - return to the dashboard",
 		"/theme auto|dark|light - set terminal appearance",
 		"/enqueue <path>... - enqueue while stopped",
-		"/search [-limit N] <query> - keyword search",
+		searchMaintenanceUsage + " - stopped-node hybrid search",
 		"/deadletters list [-class C] [-limit N]",
 		"/deadletters redrive -file-ids 1,2",
 		"/deadletters redrive -class poison",

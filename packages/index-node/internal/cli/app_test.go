@@ -307,7 +307,8 @@ func TestHelpWritesCompleteCommandReferenceToLog(t *testing.T) {
 	all := strings.Join(messages, "\n")
 	for _, want := range []string{
 		"/start", "/config reload", "/config load <path>", "/theme auto|dark|light",
-		"/enqueue <path>...", "/search [-limit N] <query>",
+		"/enqueue <path>...", "/search [-mode hybrid|keyword|semantic]",
+		"-path-prefix P", "-kind K[,K]", "-mtime-from-ns N", "-mtime-to-ns N",
 		"/deadletters list [-class C] [-limit N]",
 		"/deadletters redrive -file-ids 1,2", "/quit or /exit",
 	} {
@@ -394,7 +395,7 @@ func TestMaintenanceUsesTypedInPackageExecutorWithoutCallback(t *testing.T) {
 	if !ok {
 		t.Fatalf("maintenance command result = %T, want maintenanceResultMsg", command())
 	}
-	if message.err != nil || len(message.lines) != 1 || !strings.Contains(message.lines[0], "/search [-limit N]") {
+	if message.err != nil || len(message.lines) != 2 || !strings.Contains(message.lines[0], "/search [-mode hybrid|keyword|semantic]") {
 		t.Fatalf("maintenance help result = (lines=%#v, err=%v)", message.lines, message.err)
 	}
 	_, followUp := m.Update(message)

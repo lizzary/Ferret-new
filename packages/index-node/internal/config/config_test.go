@@ -24,18 +24,23 @@ func TestDefault(t *testing.T) {
 		},
 		Compute: ComputeConfig{
 			Endpoint:        "dns:///compute:7801",
+			RequestTimeout:  30 * time.Second,
 			BatchSize:       32,
 			BatchLinger:     100 * time.Millisecond,
 			InflightBatches: 8,
 			Breaker:         BreakerConfig{Failures: 5, OpenFor: 30 * time.Second},
 		},
 		Pipeline: PipelineConfig{
-			IOBytesInflight: 256 << 20,
-			CPUPercentCap:   50,
-			MaxFileSize:     512 << 20,
-			MaxExtractBytes: 2 << 20,
-			VideoFrames:     5,
-			FFmpegPath:      "ffmpeg",
+			IOBytesInflight:    256 << 20,
+			CPUPercentCap:      50,
+			MaxFileSize:        512 << 20,
+			MaxExtractBytes:    2 << 20,
+			ImageSize:          384,
+			ImageJPEGQuality:   90,
+			ImageMaxPixels:     25_000_000,
+			ImageBytesInflight: 256 << 20,
+			VideoFrames:        5,
+			FFmpegPath:         "ffmpeg",
 		},
 		Index: IndexConfig{
 			CommitMaxOps:   1000,
@@ -45,6 +50,7 @@ func TestDefault(t *testing.T) {
 				EFConstruction:   200,
 				EFSearch:         64,
 				SnapshotInterval: 10 * time.Minute,
+				SnapshotChanges:  5000,
 			},
 		},
 		Retry: RetryConfig{
@@ -82,6 +88,9 @@ watch:
     - {path: /from-file, recursive: true}
 compute:
   batch_size: 16
+  request_timeout: 12s
+pipeline:
+  image_size: 512
 log:
   level: debug
 `, filepath.ToSlash(dataDir)))
@@ -90,6 +99,9 @@ log:
 	t.Setenv("INDEXNODE_WATCH_ROOTS", `[{path: /from-env, recursive: false}]`)
 	t.Setenv("INDEXNODE_COMPUTE_BREAKER", `{failures: 7, open_for: 40s}`)
 	t.Setenv("INDEXNODE_COMPUTE_BREAKER_OPEN_FOR", "45s")
+	t.Setenv("INDEXNODE_COMPUTE_REQUEST_TIMEOUT", "17s")
+	t.Setenv("INDEXNODE_PIPELINE_IMAGE_JPEG_QUALITY", "88")
+	t.Setenv("INDEXNODE_INDEX_VECTOR_SNAPSHOT_CHANGES", "7000")
 	t.Setenv("INDEXNODE_LOG_REDACT_PATHS", "true")
 
 	cfg, err := Load(configPath)
@@ -105,6 +117,9 @@ log:
 	if cfg.Compute.BatchSize != 16 {
 		t.Errorf("Compute.BatchSize = %d, want file value 16", cfg.Compute.BatchSize)
 	}
+	if cfg.Compute.RequestTimeout != 17*time.Second {
+		t.Errorf("Compute.RequestTimeout = %v, want environment value 17s", cfg.Compute.RequestTimeout)
+	}
 	if cfg.Compute.Breaker.Failures != 7 || cfg.Compute.Breaker.OpenFor != 45*time.Second {
 		t.Errorf("Compute.Breaker = %#v, want failures=7 and open_for=45s", cfg.Compute.Breaker)
 	}
@@ -113,6 +128,12 @@ log:
 	}
 	if cfg.Pipeline.MaxFileSize != 512<<20 {
 		t.Errorf("Pipeline.MaxFileSize = %d, want untouched default", cfg.Pipeline.MaxFileSize)
+	}
+	if cfg.Pipeline.ImageSize != 512 || cfg.Pipeline.ImageJPEGQuality != 88 {
+		t.Errorf("Pipeline image settings = size %d quality %d", cfg.Pipeline.ImageSize, cfg.Pipeline.ImageJPEGQuality)
+	}
+	if cfg.Index.Vector.SnapshotChanges != 7000 {
+		t.Errorf("Vector.SnapshotChanges = %d, want environment value 7000", cfg.Index.Vector.SnapshotChanges)
 	}
 
 	uuidPattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -230,6 +251,11 @@ func TestExampleConfigurationLoads(t *testing.T) {
 	}
 	if cfg.Index.Vector.SnapshotInterval != 10*time.Minute {
 		t.Fatalf("snapshot interval = %v", cfg.Index.Vector.SnapshotInterval)
+	}
+	if cfg.Compute.RequestTimeout != 30*time.Second || cfg.Pipeline.ImageSize != 384 ||
+		cfg.Pipeline.ImageJPEGQuality != 90 || cfg.Pipeline.ImageMaxPixels != 25_000_000 ||
+		cfg.Pipeline.ImageBytesInflight != 256<<20 || cfg.Index.Vector.SnapshotChanges != 5000 {
+		t.Fatalf("M5 example settings = compute=%v pipeline=%+v vector=%+v", cfg.Compute, cfg.Pipeline, cfg.Index.Vector)
 	}
 }
 
@@ -355,12 +381,20 @@ func TestValidateReportsQualifiedFields(t *testing.T) {
 		{name: "overlapping roots", change: func(c *Config) { c.Watch.Roots = []WatchRoot{{Path: "/a"}, {Path: "/a/b"}} }, want: "overlaps"},
 		{name: "watch buffer", change: func(c *Config) { c.Watch.BufferSize = 0 }, want: "watch.buffer_size"},
 		{name: "compute batch", change: func(c *Config) { c.Compute.BatchSize = 0 }, want: "compute.batch_size"},
+		{name: "compute timeout", change: func(c *Config) { c.Compute.RequestTimeout = 0 }, want: "compute.request_timeout"},
 		{name: "compute breaker", change: func(c *Config) { c.Compute.Breaker.OpenFor = 0 }, want: "compute.breaker.open_for"},
 		{name: "io concurrency", change: func(c *Config) { c.Pipeline.IOConcurrency = -1 }, want: "pipeline.io_concurrency"},
 		{name: "cpu cap", change: func(c *Config) { c.Pipeline.CPUPercentCap = 101 }, want: "pipeline.cpu_percent_cap"},
+		{name: "image size", change: func(c *Config) { c.Pipeline.ImageSize = 0 }, want: "pipeline.image_size"},
+		{name: "image quality", change: func(c *Config) { c.Pipeline.ImageJPEGQuality = 101 }, want: "pipeline.image_jpeg_quality"},
+		{name: "image pixels", change: func(c *Config) { c.Pipeline.ImageMaxPixels = 0 }, want: "pipeline.image_max_pixels"},
+		{name: "image pixels overflow", change: func(c *Config) { c.Pipeline.ImageMaxPixels = math.MaxInt64/4 + 1 }, want: "pipeline.image_max_pixels"},
+		{name: "image inflight", change: func(c *Config) { c.Pipeline.ImageBytesInflight = 0 }, want: "pipeline.image_bytes_inflight"},
+		{name: "image inflight below one image", change: func(c *Config) { c.Pipeline.ImageBytesInflight = c.Pipeline.ImageMaxPixels*4 - 1 }, want: "pipeline.image_bytes_inflight"},
 		{name: "video frames", change: func(c *Config) { c.Pipeline.VideoFrames = 1 << 16 }, want: "pipeline.video_frames"},
 		{name: "commit interval", change: func(c *Config) { c.Index.CommitInterval = 0 }, want: "index.commit_interval"},
 		{name: "vector construction", change: func(c *Config) { c.Index.Vector.EFConstruction = c.Index.Vector.M - 1 }, want: "index.vector.ef_construction"},
+		{name: "vector snapshot changes", change: func(c *Config) { c.Index.Vector.SnapshotChanges = 0 }, want: "index.vector.snapshot_changes"},
 		{name: "retry cap", change: func(c *Config) { c.Retry.Cap = c.Retry.Base - time.Nanosecond }, want: "retry.cap"},
 		{name: "retry ratio", change: func(c *Config) { c.Retry.RetryBudgetRatio = math.NaN() }, want: "retry.retry_budget_ratio"},
 		{name: "retry ratio zero", change: func(c *Config) { c.Retry.RetryBudgetRatio = 0 }, want: "retry.retry_budget_ratio"},

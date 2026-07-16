@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package ferret.compute.v1;
+
+option go_package = "github.com/lizzary/index-node/gen/compute/v1;computev1";
+
+// EmbedService is the index-node/compute-node contract used by both durable
+// media indexing and interactive semantic queries.
+service EmbedService {
+  rpc EmbedImages(EmbedImagesRequest) returns (EmbedImagesResponse);
+  rpc EmbedText(EmbedTextRequest) returns (EmbedTextResponse);
+}
+
+message ModelInfo {
+  string model_version = 1;
+  uint32 dims = 2;
+}
+
+message Embedding {
+  repeated float values = 1 [packed = true];
+}
+
+message EmbedImagesRequest {
+  // Each item is a normalized JPEG frame. Cardinality and order are preserved
+  // by the response.
+  repeated bytes jpeg = 1;
+}
+
+message EmbedImagesResponse {
+  repeated Embedding embeddings = 1;
+  ModelInfo model = 2;
+}
+
+message EmbedTextRequest {
+  string text = 1;
+}
+
+message EmbedTextResponse {
+  Embedding embedding = 1;
+  ModelInfo model = 2;
+}

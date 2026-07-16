@@ -82,6 +82,12 @@ type Config struct {
 	ReleaseBatch int
 	Clock        Clock
 	IsFailure    func(error) bool
+	// Notify wakes the scheduler after durable waiting_dep rows are released.
+	// It is called outside breaker and store locks and may be coalescing.
+	Notify func()
+	// OnTransition observes every breaker state change, including the lazy
+	// open-to-half-open cooldown transition.
+	OnTransition func(Transition)
 }
 
 const defaultReleaseBatch = 1000
@@ -133,9 +139,10 @@ type Transition struct {
 type Breaker struct {
 	mu sync.Mutex
 
-	failures int
-	openFor  time.Duration
-	clock    Clock
+	failures     int
+	openFor      time.Duration
+	clock        Clock
+	onTransition func(Transition)
 
 	state               State
 	consecutiveFailures int
@@ -153,10 +160,11 @@ func NewBreaker(config Config) (*Breaker, error) {
 		return nil, err
 	}
 	return &Breaker{
-		failures: normalized.Failures,
-		openFor:  normalized.OpenFor,
-		clock:    normalized.Clock,
-		state:    StateClosed,
+		failures:     normalized.Failures,
+		openFor:      normalized.OpenFor,
+		clock:        normalized.Clock,
+		onTransition: normalized.OnTransition,
+		state:        StateClosed,
 	}, nil
 }
 
@@ -165,36 +173,42 @@ func NewBreaker(config Config) (*Breaker, error) {
 // Controller.Execute, which guarantees completion even when the call panics.
 func (breaker *Breaker) Allow() (*Permit, error) {
 	breaker.mu.Lock()
-	defer breaker.mu.Unlock()
-
-	breaker.advanceLocked(breaker.clock.Now())
+	transition := breaker.advanceLocked(breaker.clock.Now())
+	var permit *Permit
+	var err error
 	switch breaker.state {
 	case StateClosed:
-		return &Permit{breaker: breaker, epoch: breaker.epoch}, nil
+		permit = &Permit{breaker: breaker, epoch: breaker.epoch}
 	case StateOpen:
-		return nil, ErrOpen
+		err = ErrOpen
 	case StateHalfOpen:
 		if breaker.probeInFlight {
-			return nil, probeInFlightError{}
+			err = probeInFlightError{}
+			break
 		}
 		breaker.probeInFlight = true
-		return &Permit{breaker: breaker, epoch: breaker.epoch, probe: true}, nil
+		permit = &Permit{breaker: breaker, epoch: breaker.epoch, probe: true}
 	default:
-		return nil, ErrOpen
+		err = ErrOpen
 	}
+	breaker.mu.Unlock()
+	breaker.notifyTransition(transition)
+	return permit, err
 }
 
 // Snapshot returns a coherent state view. Reaching the cooldown deadline is a
 // lazy Open -> HalfOpen transition, so no private timer goroutine is required.
 func (breaker *Breaker) Snapshot() Snapshot {
 	breaker.mu.Lock()
-	defer breaker.mu.Unlock()
-	breaker.advanceLocked(breaker.clock.Now())
-	return Snapshot{
+	transition := breaker.advanceLocked(breaker.clock.Now())
+	snapshot := Snapshot{
 		State: breaker.state, ConsecutiveFailures: breaker.consecutiveFailures,
 		OpenUntil: breaker.openUntil, ProbeInFlight: breaker.probeInFlight,
 		Epoch: breaker.epoch,
 	}
+	breaker.mu.Unlock()
+	breaker.notifyTransition(transition)
+	return snapshot
 }
 
 // State returns the current state, applying a due cooldown transition.
@@ -206,22 +220,30 @@ func (breaker *Breaker) State() State { return breaker.Snapshot().State }
 // callback must not call back into the breaker.
 func (breaker *Breaker) withHalfOpenIdle(epoch uint64, release func() (int64, error)) (int64, bool, error) {
 	breaker.mu.Lock()
-	defer breaker.mu.Unlock()
-	breaker.advanceLocked(breaker.clock.Now())
+	transition := breaker.advanceLocked(breaker.clock.Now())
 	if breaker.state != StateHalfOpen || breaker.epoch != epoch || breaker.probeInFlight {
+		breaker.mu.Unlock()
+		breaker.notifyTransition(transition)
 		return 0, false, nil
 	}
 	released, err := release()
+	breaker.mu.Unlock()
+	breaker.notifyTransition(transition)
 	return released, true, err
 }
 
-func (breaker *Breaker) advanceLocked(now time.Time) {
+func (breaker *Breaker) advanceLocked(now time.Time) Transition {
+	transition := Transition{From: breaker.state, To: breaker.state}
 	if breaker.state != StateOpen || now.Before(breaker.openUntil) {
-		return
+		return transition
 	}
 	breaker.state = StateHalfOpen
 	breaker.probeInFlight = false
 	breaker.epoch++
+	transition.To = breaker.state
+	transition.Changed = true
+	transition.Accepted = true
+	return transition
 }
 
 type completion uint8
@@ -234,17 +256,18 @@ const (
 
 func (breaker *Breaker) complete(epoch uint64, probe bool, result completion) Transition {
 	breaker.mu.Lock()
-	defer breaker.mu.Unlock()
 
 	from := breaker.state
 	transition := Transition{From: from, To: from}
 	if epoch != breaker.epoch {
+		breaker.mu.Unlock()
 		return transition
 	}
 
 	switch breaker.state {
 	case StateClosed:
 		if probe {
+			breaker.mu.Unlock()
 			return transition
 		}
 		transition.Accepted = true
@@ -262,6 +285,7 @@ func (breaker *Breaker) complete(epoch uint64, probe bool, result completion) Tr
 		}
 	case StateHalfOpen:
 		if !probe || !breaker.probeInFlight {
+			breaker.mu.Unlock()
 			return transition
 		}
 		transition.Accepted = true
@@ -280,7 +304,15 @@ func (breaker *Breaker) complete(epoch uint64, probe bool, result completion) Tr
 	}
 	transition.To = breaker.state
 	transition.Changed = transition.From != transition.To
+	breaker.mu.Unlock()
+	breaker.notifyTransition(transition)
 	return transition
+}
+
+func (breaker *Breaker) notifyTransition(transition Transition) {
+	if transition.Changed && breaker.onTransition != nil {
+		breaker.onTransition(transition)
+	}
 }
 
 func (breaker *Breaker) openLocked(now time.Time) {

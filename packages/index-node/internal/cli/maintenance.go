@@ -16,6 +16,7 @@ import (
 const (
 	defaultSearchLimit     = 20
 	defaultDeadLetterLimit = 100
+	searchMaintenanceUsage = "/search [-mode hybrid|keyword|semantic] [-limit N] [-path-prefix P] [-kind K[,K]...] [-mtime-from-ns N] [-mtime-to-ns N] <query>"
 )
 
 // executeMaintenance is the stopped-node application boundary used by the
@@ -23,6 +24,18 @@ const (
 // operations directly; no command-line flag set or JSON serialization is
 // involved.
 func executeMaintenance(ctx context.Context, cfg *config.Config, command string, arguments []string) ([]string, error) {
+	return executeMaintenanceWithSearch(ctx, cfg, command, arguments, maintenance.Search)
+}
+
+type typedMaintenanceSearch func(context.Context, *config.Config, index.SearchRequest) (index.SearchResponse, error)
+
+func executeMaintenanceWithSearch(
+	ctx context.Context,
+	cfg *config.Config,
+	command string,
+	arguments []string,
+	search typedMaintenanceSearch,
+) ([]string, error) {
 	command = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(command)), "/")
 	switch command {
 	case "enqueue":
@@ -54,18 +67,20 @@ func executeMaintenance(ctx context.Context, cfg *config.Config, command string,
 		if request.help {
 			return maintenanceHelp("search"), nil
 		}
-		dataDir, err := maintenanceDataDir(cfg)
-		if err != nil {
+		if _, err := maintenanceDataDir(cfg); err != nil {
 			return nil, err
 		}
-		hits, err := maintenance.SearchKeyword(ctx, dataDir, request.query, request.limit)
+		if search == nil {
+			return nil, fmt.Errorf("search command: typed search service is required")
+		}
+		response, err := search(ctx, cfg, request.indexRequest())
 		if err != nil {
-			if len(hits) == 0 {
+			if len(response.Hits) == 0 {
 				return nil, err
 			}
-			return formatSearchResults(hits), err
+			return formatSearchResults(response), err
 		}
-		return formatSearchResults(hits), nil
+		return formatSearchResults(response), nil
 
 	case "deadletters":
 		return executeDeadLetterMaintenance(ctx, cfg, arguments)
@@ -132,15 +147,23 @@ func executeDeadLetterMaintenance(ctx context.Context, cfg *config.Config, argum
 }
 
 type searchMaintenanceRequest struct {
-	query string
-	limit int
-	help  bool
+	query   string
+	mode    index.Mode
+	limit   int
+	filters index.Filters
+	help    bool
+}
+
+func (request searchMaintenanceRequest) indexRequest() index.SearchRequest {
+	return index.SearchRequest{
+		Query: request.query, Mode: request.mode, TopK: request.limit, Filters: request.filters,
+	}
 }
 
 func parseSearchArguments(arguments []string) (searchMaintenanceRequest, error) {
-	request := searchMaintenanceRequest{limit: defaultSearchLimit}
+	request := searchMaintenanceRequest{mode: index.ModeHybrid, limit: defaultSearchLimit}
 	positionals := make([]string, 0, len(arguments))
-	limitSet := false
+	seen := make(map[string]bool)
 	optionsEnded := false
 
 	for index := 0; index < len(arguments); index++ {
@@ -155,25 +178,69 @@ func parseSearchArguments(arguments []string) (searchMaintenanceRequest, error) 
 		}
 		name, value, inline, option := splitMaintenanceOption(token)
 		if !optionsEnded && option {
-			if name != "limit" {
+			switch name {
+			case "mode", "limit", "path-prefix", "kind", "mtime-from-ns", "mtime-to-ns":
+			default:
 				return request, fmt.Errorf("search command: unknown option %q", token)
 			}
-			if limitSet {
-				return request, fmt.Errorf("search command: -limit may be provided only once")
+			if name != "kind" && seen[name] {
+				return request, fmt.Errorf("search command: -%s may be provided only once", name)
 			}
 			if !inline {
 				index++
 				if index >= len(arguments) {
-					return request, fmt.Errorf("search command: -limit requires a value")
+					return request, fmt.Errorf("search command: -%s requires a value", name)
 				}
 				value = arguments[index]
 			}
-			limit, err := parseMaintenanceLimit("search command", value)
-			if err != nil {
-				return request, err
+			switch name {
+			case "mode":
+				mode, err := parseMaintenanceSearchMode(value)
+				if err != nil {
+					return request, err
+				}
+				request.mode = mode
+
+			case "limit":
+				limit, err := parseMaintenanceLimit("search command", value)
+				if err != nil {
+					return request, err
+				}
+				request.limit = limit
+
+			case "path-prefix":
+				if strings.TrimSpace(value) == "" {
+					return request, fmt.Errorf("search command: path prefix is empty")
+				}
+				if strings.ContainsRune(value, '\x00') {
+					return request, fmt.Errorf("search command: path prefix contains NUL")
+				}
+				request.filters.PathPrefix = value
+
+			case "kind":
+				kinds, err := appendMaintenanceSearchKinds(request.filters.Kinds, value)
+				if err != nil {
+					return request, err
+				}
+				request.filters.Kinds = kinds
+
+			case "mtime-from-ns":
+				mtime, err := parseMaintenanceMTime(name, value)
+				if err != nil {
+					return request, err
+				}
+				request.filters.MTimeFromNS = &mtime
+
+			case "mtime-to-ns":
+				mtime, err := parseMaintenanceMTime(name, value)
+				if err != nil {
+					return request, err
+				}
+				request.filters.MTimeToNS = &mtime
 			}
-			request.limit = limit
-			limitSet = true
+			if name != "kind" {
+				seen[name] = true
+			}
 			continue
 		}
 		positionals = append(positionals, token)
@@ -183,7 +250,57 @@ func parseSearchArguments(arguments []string) (searchMaintenanceRequest, error) 
 	if request.query == "" {
 		return request, fmt.Errorf("search command: query is required")
 	}
+	if request.filters.MTimeFromNS != nil && request.filters.MTimeToNS != nil &&
+		*request.filters.MTimeFromNS > *request.filters.MTimeToNS {
+		return request, fmt.Errorf("search command: mtime range is inverted")
+	}
 	return request, nil
+}
+
+func parseMaintenanceSearchMode(value string) (index.Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "hybrid":
+		return index.ModeHybrid, nil
+	case "keyword":
+		return index.ModeKeyword, nil
+	case "semantic":
+		return index.ModeSemantic, nil
+	default:
+		return index.ModeHybrid, fmt.Errorf(
+			"search command: invalid mode %q (want hybrid, keyword, or semantic)",
+			value,
+		)
+	}
+}
+
+func appendMaintenanceSearchKinds(existing []store.FileKind, value string) ([]store.FileKind, error) {
+	seen := make(map[store.FileKind]struct{}, len(existing))
+	for _, kind := range existing {
+		seen[kind] = struct{}{}
+	}
+	result := append([]store.FileKind(nil), existing...)
+	for _, part := range strings.Split(value, ",") {
+		kind := store.FileKind(strings.ToLower(strings.TrimSpace(part)))
+		switch kind {
+		case store.FileKindText, store.FileKindImage, store.FileKindVideo, store.FileKindOther:
+		default:
+			return nil, fmt.Errorf("search command: invalid kind %q", strings.TrimSpace(part))
+		}
+		if _, duplicate := seen[kind]; duplicate {
+			continue
+		}
+		seen[kind] = struct{}{}
+		result = append(result, kind)
+	}
+	return result, nil
+}
+
+func parseMaintenanceMTime(name, value string) (int64, error) {
+	mtime, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("search command: invalid -%s value %q", name, value)
+	}
+	return mtime, nil
 }
 
 type deadLetterListMaintenanceRequest struct {
@@ -429,7 +546,10 @@ func maintenanceHelp(command string) []string {
 	case "enqueue":
 		return []string{"/enqueue <path>... - enqueue paths while stopped"}
 	case "search":
-		return []string{"/search [-limit N] <query> - keyword search"}
+		return []string{
+			searchMaintenanceUsage,
+			"Defaults to hybrid; -kind accepts repeated/comma text,image,video,other; mtime bounds are inclusive Unix ns.",
+		}
 	case "deadletters":
 		return []string{
 			"/deadletters list [-class C] [-limit N]",
@@ -466,16 +586,34 @@ func formatEnqueueResults(results []maintenance.EnqueueResult) []string {
 	return lines
 }
 
-func formatSearchResults(hits []index.KeywordHit) []string {
-	lines := []string{fmt.Sprintf("Keyword search returned %d hit(s).", len(hits))}
-	for _, hit := range hits {
+func formatSearchResults(response index.SearchResponse) []string {
+	summary := fmt.Sprintf("Search returned %d hit(s).", len(response.Hits))
+	if response.DegradedSemantic {
+		summary += " Semantic search unavailable; results are degraded."
+	}
+	if response.Incomplete {
+		summary += " Candidate limit reached; results may be incomplete."
+	}
+	lines := []string{summary}
+	for _, hit := range response.Hits {
+		frameTimestamp := "-"
+		if hit.FrameTSMS != nil {
+			frameTimestamp = strconv.FormatInt(*hit.FrameTSMS, 10)
+		}
+		sources := "-"
+		if len(hit.Sources) != 0 {
+			sources = strings.Join(hit.Sources, ",")
+		}
 		lines = append(lines, fmt.Sprintf(
-			"file=%d score=%.4f status=%s kind=%s %s",
+			"file=%d score=%.6f sources=%s frame_ts_ms=%s status=%s kind=%s path=%q snippet=%q",
 			hit.FileID,
 			hit.Score,
+			sources,
+			frameTimestamp,
 			hit.Status,
 			hit.Kind,
 			hit.Path,
+			hit.Snippet,
 		))
 	}
 	return lines

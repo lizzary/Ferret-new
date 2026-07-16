@@ -114,6 +114,42 @@ func TestCatalogCRUDAndGenerationFence(t *testing.T) {
 	}
 }
 
+func TestGetFilesByIDsDeduplicatesOmitsMissingAndValidates(t *testing.T) {
+	ctx := context.Background()
+	durable := openTestStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	create := func(path string) File {
+		file, err := durable.UpsertFile(ctx, File{
+			Path: path, Kind: FileKindText, Generation: 1, Status: FileStatusIndexed,
+		})
+		if err != nil {
+			t.Fatalf("UpsertFile(%q) error = %v", path, err)
+		}
+		return file
+	}
+	first := create("/batch/first.txt")
+	second := create("/batch/second.txt")
+
+	files, err := durable.GetFilesByIDs(ctx, []int64{second.ID, first.ID, second.ID, 999999})
+	if err != nil {
+		t.Fatalf("GetFilesByIDs() error = %v", err)
+	}
+	if len(files) != 2 || files[first.ID].Path != first.Path || files[second.ID].Path != second.Path {
+		t.Fatalf("GetFilesByIDs() = %#v", files)
+	}
+	empty, err := durable.GetFilesByIDs(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("GetFilesByIDs(empty) = %#v, %v", empty, err)
+	}
+	if _, err := durable.GetFilesByIDs(ctx, []int64{0}); err == nil {
+		t.Fatal("GetFilesByIDs(invalid) error = nil")
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := durable.GetFilesByIDs(canceled, []int64{first.ID}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetFilesByIDs(canceled) error = %v", err)
+	}
+}
+
 func TestCatalogValidation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

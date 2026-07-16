@@ -27,16 +27,30 @@ type WaitingStore interface {
 	ReleaseWaitingDep(context.Context, int) (int64, error)
 }
 
+// WaitingBatchStore extends WaitingStore with the transactional operation used
+// by a micro-batch. A rejected or failed RPC must park every represented task,
+// or none of them, because the batch owns one breaker permit.
+type WaitingBatchStore interface {
+	MarkWaitingDepBatch(context.Context, []int64, string) error
+}
+
 // WaitingDependencyError preserves both the controller sentinel and the
 // original rejection/failure for errors.Is/errors.As inspection.
 type WaitingDependencyError struct {
-	TaskID int64
-	Cause  error
+	TaskID  int64
+	TaskIDs []int64
+	Cause   error
 }
 
 func (failure *WaitingDependencyError) Error() string {
 	if failure == nil {
 		return ErrWaitingDependency.Error()
+	}
+	if len(failure.TaskIDs) > 1 {
+		if failure.Cause == nil {
+			return fmt.Sprintf("%s: tasks %v", ErrWaitingDependency, failure.TaskIDs)
+		}
+		return fmt.Sprintf("%s: tasks %v: %v", ErrWaitingDependency, failure.TaskIDs, failure.Cause)
 	}
 	if failure.Cause == nil {
 		return fmt.Sprintf("%s: task %d", ErrWaitingDependency, failure.TaskID)
@@ -104,20 +118,26 @@ func (controller *Controller) Snapshot() Snapshot { return controller.breaker.Sn
 // Acquire obtains a task-aware call permit. A rejected task is durably parked
 // before ErrWaitingDependency is returned.
 func (controller *Controller) Acquire(ctx context.Context, taskID int64) (*Call, error) {
-	if ctx == nil {
-		return nil, errors.New("embed controller: context is required")
-	}
-	if err := ctx.Err(); err != nil {
+	batch, err := controller.AcquireBatch(ctx, []int64{taskID})
+	if err != nil {
 		return nil, err
 	}
-	if taskID <= 0 {
-		return nil, ErrInvalidTaskID
+	return &Call{batch: batch}, nil
+}
+
+// AcquireBatch obtains exactly one breaker permit for an indivisible compute
+// RPC. If admission is rejected, all represented tasks are parked in one
+// durable transaction before ErrWaitingDependency is returned.
+func (controller *Controller) AcquireBatch(ctx context.Context, taskIDs []int64) (*BatchCall, error) {
+	ids, err := validatedTaskIDs(ctx, taskIDs)
+	if err != nil {
+		return nil, err
 	}
 	permit, err := controller.breaker.Allow()
 	if err != nil {
-		return nil, controller.park(ctx, taskID, err)
+		return nil, controller.parkBatch(ctx, ids, err)
 	}
-	return &Call{controller: controller, taskID: taskID, permit: permit}, nil
+	return &BatchCall{controller: controller, taskIDs: ids, permit: permit}, nil
 }
 
 // Execute wraps a single dependency operation. Result values may be captured
@@ -147,54 +167,91 @@ func (controller *Controller) Execute(ctx context.Context, taskID int64, operati
 // Park explicitly moves a claimed task to waiting_dep. It is useful for a
 // later micro-batcher that has multiple task IDs behind one rejected RPC.
 func (controller *Controller) Park(ctx context.Context, taskID int64, cause error) error {
-	if ctx == nil {
-		return errors.New("embed controller: context is required")
-	}
-	if taskID <= 0 {
-		return ErrInvalidTaskID
-	}
-	return controller.park(ctx, taskID, cause)
+	return controller.ParkBatch(ctx, []int64{taskID}, cause)
 }
 
-func (controller *Controller) park(ctx context.Context, taskID int64, cause error) error {
+// ParkBatch atomically parks all tasks represented by one compute RPC.
+func (controller *Controller) ParkBatch(ctx context.Context, taskIDs []int64, cause error) error {
+	ids, err := validatedTaskIDs(ctx, taskIDs)
+	if err != nil {
+		return err
+	}
+	return controller.parkBatch(ctx, ids, cause)
+}
+
+func (controller *Controller) parkBatch(ctx context.Context, taskIDs []int64, cause error) error {
 	reason := ErrOpen.Error()
 	if cause != nil {
 		reason = cause.Error()
 	}
-	if err := controller.store.MarkWaitingDep(ctx, taskID, reason); err != nil {
-		return fmt.Errorf("embed controller: park task %d: %w", taskID, err)
+	if batchStore, ok := controller.store.(WaitingBatchStore); ok {
+		if err := batchStore.MarkWaitingDepBatch(ctx, taskIDs, reason); err != nil {
+			return fmt.Errorf("embed controller: park tasks %v: %w", taskIDs, err)
+		}
+	} else if len(taskIDs) == 1 {
+		if err := controller.store.MarkWaitingDep(ctx, taskIDs[0], reason); err != nil {
+			return fmt.Errorf("embed controller: park task %d: %w", taskIDs[0], err)
+		}
+	} else {
+		return errors.New("embed controller: waiting store does not support atomic batch parking")
 	}
 	controller.waiterVersion.Add(1)
 	controller.signal()
 
-	waitingErr := &WaitingDependencyError{TaskID: taskID, Cause: cause}
+	waitingErr := &WaitingDependencyError{TaskID: taskIDs[0], TaskIDs: append([]int64(nil), taskIDs...), Cause: cause}
 	// An open rejection may race the successful half-open probe. If the
 	// breaker closed before this durable write completed, request another drain
 	// so this late waiter cannot be stranded indefinitely.
 	if controller.breaker.State() == StateClosed {
 		controller.requestDrain()
 		if err := controller.drainWaiting(ctx); err != nil {
-			return errors.Join(waitingErr, err)
+			// The scheduler must see durable-store failures as fatal. Combining
+			// them with ErrWaitingDependency would incorrectly tell the worker to
+			// suppress its normal fatal-error path.
+			return err
 		}
 	}
 	return waitingErr
 }
 
+func validatedTaskIDs(ctx context.Context, taskIDs []int64) ([]int64, error) {
+	if ctx == nil {
+		return nil, errors.New("embed controller: context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(taskIDs) == 0 {
+		return nil, ErrInvalidTaskID
+	}
+	ids := make([]int64, 0, len(taskIDs))
+	seen := make(map[int64]struct{}, len(taskIDs))
+	for _, taskID := range taskIDs {
+		if taskID <= 0 {
+			return nil, ErrInvalidTaskID
+		}
+		if _, exists := seen[taskID]; exists {
+			continue
+		}
+		seen[taskID] = struct{}{}
+		ids = append(ids, taskID)
+	}
+	return ids, nil
+}
+
 // Call is a task-aware breaker permit. Exactly one of Success, Failure, or
 // Abort wins; all are safe to invoke defensively from concurrent cleanup.
 type Call struct {
-	controller *Controller
-	taskID     int64
-	permit     *Permit
-
-	once sync.Once
-	err  error
+	batch *BatchCall
 }
 
 // Success closes a half-open breaker and synchronously releases all durable
 // waiters in bounded batches.
 func (call *Call) Success(ctx context.Context) error {
-	return call.finish(ctx, nil, false)
+	if call == nil {
+		return errors.New("embed controller: invalid call permit")
+	}
+	return call.batch.Success(ctx)
 }
 
 // Failure reports a transport/dependency error. Failures below the configured
@@ -205,14 +262,42 @@ func (call *Call) Failure(ctx context.Context, cause error) error {
 	if cause == nil {
 		return call.Success(ctx)
 	}
-	return call.finish(ctx, cause, true)
+	if call == nil {
+		return errors.New("embed controller: invalid call permit")
+	}
+	return call.batch.Failure(ctx, cause)
 }
 
 // Abort relinquishes an unfinished permit. It never performs storage I/O and
 // is therefore safe in a panic defer. Aborting the half-open probe reopens the
 // breaker for a fresh cooldown.
 func (call *Call) Abort() {
-	if call == nil {
+	if call != nil {
+		call.batch.Abort()
+	}
+}
+
+// BatchCall is a breaker permit shared by every task in one indivisible RPC.
+type BatchCall struct {
+	controller *Controller
+	taskIDs    []int64
+	permit     *Permit
+
+	once sync.Once
+	err  error
+}
+
+func (call *BatchCall) Success(ctx context.Context) error { return call.finish(ctx, nil, false) }
+
+func (call *BatchCall) Failure(ctx context.Context, cause error) error {
+	if cause == nil {
+		return call.Success(ctx)
+	}
+	return call.finish(ctx, cause, true)
+}
+
+func (call *BatchCall) Abort() {
+	if call == nil || call.controller == nil || call.permit == nil {
 		return
 	}
 	call.once.Do(func() {
@@ -221,7 +306,7 @@ func (call *Call) Abort() {
 	})
 }
 
-func (call *Call) finish(ctx context.Context, cause error, failed bool) error {
+func (call *BatchCall) finish(ctx context.Context, cause error, failed bool) error {
 	if call == nil || call.controller == nil || call.permit == nil {
 		return errors.New("embed controller: invalid call permit")
 	}
@@ -241,7 +326,7 @@ func (call *Call) finish(ctx context.Context, cause error, failed bool) error {
 			// Every dependency-health failure is a zero-charge lease. park
 			// immediately redrives it when the breaker is still closed, while
 			// an open/half-open breaker leaves it durably waiting.
-			call.err = call.controller.park(ctx, call.taskID, cause)
+			call.err = call.controller.parkBatch(ctx, call.taskIDs, cause)
 			return
 		}
 
@@ -250,7 +335,90 @@ func (call *Call) finish(ctx context.Context, cause error, failed bool) error {
 		transition := call.permit.Success()
 		call.controller.afterTransition(transition)
 		if err := call.controller.drainWaiting(ctx); err != nil {
-			call.err = errors.Join(cause, err)
+			call.err = err
+			return
+		}
+		call.err = cause
+	})
+	return call.err
+}
+
+// ExecuteUnbound runs a query-side dependency call through the same breaker
+// without fabricating a durable task. A half-open query is therefore a real
+// recovery probe: success closes the breaker and releases parked task work.
+func (controller *Controller) ExecuteUnbound(ctx context.Context, operation func(context.Context) error) error {
+	if operation == nil {
+		return ErrNilCall
+	}
+	if ctx == nil {
+		return errors.New("embed controller: context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	permit, err := controller.breaker.Allow()
+	if err != nil {
+		return err
+	}
+	call := &UnboundCall{controller: controller, permit: permit}
+	defer call.Abort()
+	err = operation(ctx)
+	if err == nil {
+		return call.Success(ctx)
+	}
+	if ctx.Err() != nil {
+		call.Abort()
+		return err
+	}
+	return call.Failure(ctx, err)
+}
+
+// UnboundCall is the query-side equivalent of BatchCall. Dependency failures
+// affect breaker health but never transition task rows.
+type UnboundCall struct {
+	controller *Controller
+	permit     *Permit
+	once       sync.Once
+	err        error
+}
+
+func (call *UnboundCall) Success(ctx context.Context) error { return call.finish(ctx, nil, false) }
+func (call *UnboundCall) Failure(ctx context.Context, cause error) error {
+	if cause == nil {
+		return call.Success(ctx)
+	}
+	return call.finish(ctx, cause, true)
+}
+func (call *UnboundCall) Abort() {
+	if call == nil || call.controller == nil || call.permit == nil {
+		return
+	}
+	call.once.Do(func() {
+		transition := call.permit.Abort()
+		call.controller.afterTransition(transition)
+	})
+}
+func (call *UnboundCall) finish(ctx context.Context, cause error, failed bool) error {
+	if call == nil || call.controller == nil || call.permit == nil {
+		return errors.New("embed controller: invalid unbound call permit")
+	}
+	if ctx == nil {
+		return errors.New("embed controller: context is required")
+	}
+	call.once.Do(func() {
+		if failed && ctx.Err() != nil {
+			call.controller.afterTransition(call.permit.Abort())
+			call.err = cause
+			return
+		}
+		if failed && call.controller.config.IsFailure(cause) {
+			call.controller.afterTransition(call.permit.Failure())
+			call.err = cause
+			return
+		}
+		call.controller.afterTransition(call.permit.Success())
+		if err := call.controller.drainWaiting(ctx); err != nil {
+			call.err = err
 			return
 		}
 		call.err = cause
@@ -292,10 +460,17 @@ func (controller *Controller) drainWaiting(ctx context.Context) error {
 		if released < 0 || released > int64(controller.config.ReleaseBatch) {
 			return fmt.Errorf("embed controller: store released %d tasks with limit %d", released, controller.config.ReleaseBatch)
 		}
+		controller.notifyReleased(released)
 		if released < int64(controller.config.ReleaseBatch) {
 			controller.drainPending = false
 			return nil
 		}
+	}
+}
+
+func (controller *Controller) notifyReleased(released int64) {
+	if released > 0 && controller.config.Notify != nil {
+		controller.config.Notify()
 	}
 }
 
@@ -383,6 +558,7 @@ func (controller *Controller) Run(ctx context.Context) error {
 				attemptedWaiterVersion = waiterVersion
 				watchdogExpired = false
 				releasedProbe = released > 0
+				controller.notifyReleased(released)
 				if releasedProbe {
 					probeDispatchDeadline = controller.config.Clock.Now().Add(controller.config.OpenFor)
 				}

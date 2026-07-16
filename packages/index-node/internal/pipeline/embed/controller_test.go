@@ -40,6 +40,10 @@ func (durable *fakeWaitingStore) add(taskID int64, state string, attempts int) {
 }
 
 func (durable *fakeWaitingStore) MarkWaitingDep(ctx context.Context, taskID int64, _ string) error {
+	return durable.MarkWaitingDepBatch(ctx, []int64{taskID}, "")
+}
+
+func (durable *fakeWaitingStore) MarkWaitingDepBatch(ctx context.Context, taskIDs []int64, _ string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -48,13 +52,18 @@ func (durable *fakeWaitingStore) MarkWaitingDep(ctx context.Context, taskID int6
 	if durable.markErr != nil {
 		return durable.markErr
 	}
-	task := durable.tasks[taskID]
-	if task == nil || task.state != "in_flight" {
-		return fmt.Errorf("task %d is not in flight", taskID)
+	for _, taskID := range taskIDs {
+		task := durable.tasks[taskID]
+		if task == nil || task.state != "in_flight" {
+			return fmt.Errorf("task %d is not in flight", taskID)
+		}
 	}
-	task.state = "waiting_dep"
-	if task.attempts > 0 {
-		task.attempts--
+	for _, taskID := range taskIDs {
+		task := durable.tasks[taskID]
+		task.state = "waiting_dep"
+		if task.attempts > 0 {
+			task.attempts--
+		}
 	}
 	return nil
 }
@@ -661,6 +670,111 @@ func TestControllerValidationAndStoreErrors(t *testing.T) {
 	err := controller.Park(context.Background(), 1, ErrOpen)
 	if !errors.Is(err, durable.markErr) || errors.Is(err, ErrWaitingDependency) {
 		t.Fatalf("Park(store error) = %v", err)
+	}
+}
+
+func TestControllerBatchFailureUsesOnePermitAndParksAtomically(t *testing.T) {
+	t.Parallel()
+	durable := newFakeWaitingStore()
+	durable.add(1, "in_flight", 1)
+	durable.add(2, "in_flight", 1)
+	controller, err := NewController(durable, Config{Failures: 2, OpenFor: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, err := controller.AcquireBatch(context.Background(), []int64{1, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencyErr := errors.New("compute offline")
+	if err := call.Failure(context.Background(), dependencyErr); !errors.Is(err, ErrWaitingDependency) {
+		t.Fatalf("BatchCall.Failure() = %v", err)
+	}
+	if snapshot := controller.Snapshot(); snapshot.State != StateClosed || snapshot.ConsecutiveFailures != 1 {
+		t.Fatalf("batch counted more than one failure: %+v", snapshot)
+	}
+	for _, taskID := range []int64{1, 2} {
+		task := durable.snapshot(taskID)
+		if task.state != "pending" || task.attempts != 0 {
+			t.Fatalf("task %d = %+v", taskID, task)
+		}
+	}
+}
+
+func TestControllerBatchParkingFailureReturnsStoreFatalOnly(t *testing.T) {
+	t.Parallel()
+	durable := newFakeWaitingStore()
+	durable.add(1, "in_flight", 1)
+	durable.add(2, "pending", 0)
+	controller, err := NewController(durable, Config{Failures: 1, OpenFor: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, err := controller.AcquireBatch(context.Background(), []int64{1, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parkErr := call.Failure(context.Background(), errors.New("compute offline"))
+	if parkErr == nil || errors.Is(parkErr, ErrWaitingDependency) {
+		t.Fatalf("BatchCall.Failure() = %v, want store-fatal error only", parkErr)
+	}
+	if task := durable.snapshot(1); task.state != "in_flight" || task.attempts != 1 {
+		t.Fatalf("atomic batch modified first task: %+v", task)
+	}
+}
+
+func TestControllerUnboundHalfOpenProbeClosesAndReleases(t *testing.T) {
+	t.Parallel()
+	clock := newManualClock(time.Unix(1_100, 0))
+	durable := newFakeWaitingStore()
+	durable.add(1, "in_flight", 1)
+	var notifications atomic.Int64
+	var transitionsMu sync.Mutex
+	var transitions []Transition
+	controller, err := NewController(durable, Config{
+		Failures: 1, OpenFor: time.Second, Clock: clock,
+		Notify: func() { notifications.Add(1) },
+		OnTransition: func(transition Transition) {
+			transitionsMu.Lock()
+			transitions = append(transitions, transition)
+			transitionsMu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Execute(context.Background(), 1, func(context.Context) error {
+		return errors.New("compute offline")
+	}); !errors.Is(err, ErrWaitingDependency) {
+		t.Fatalf("opening Execute() = %v", err)
+	}
+	clock.Advance(time.Second)
+	called := false
+	if err := controller.ExecuteUnbound(context.Background(), func(context.Context) error {
+		called = true
+		return nil
+	}); err != nil {
+		t.Fatalf("ExecuteUnbound() = %v", err)
+	}
+	if !called || controller.Snapshot().State != StateClosed {
+		t.Fatalf("unbound probe called=%v state=%s", called, controller.Snapshot().State)
+	}
+	if task := durable.snapshot(1); task.state != "pending" || task.attempts != 0 {
+		t.Fatalf("released task = %+v", task)
+	}
+	if notifications.Load() != 1 {
+		t.Fatalf("Notify calls = %d, want 1", notifications.Load())
+	}
+	transitionsMu.Lock()
+	defer transitionsMu.Unlock()
+	want := []State{StateOpen, StateHalfOpen, StateClosed}
+	if len(transitions) != len(want) {
+		t.Fatalf("transitions = %+v", transitions)
+	}
+	for index, state := range want {
+		if transitions[index].To != state {
+			t.Fatalf("transition %d = %+v, want to %s", index, transitions[index], state)
+		}
 	}
 }
 

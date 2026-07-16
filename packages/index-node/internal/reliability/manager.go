@@ -23,6 +23,7 @@ const (
 	DefaultBatchSize         = 256
 	DefaultPriority          = 0
 	DefaultAuditFlushTimeout = 5 * time.Second
+	DefaultModelUpgradeTick  = time.Second
 )
 
 // Store is deliberately defined by the consumer. Dead-letter state changes
@@ -51,6 +52,15 @@ type ProjectionStore interface {
 	ListDeadLettersAfter(context.Context, int64, int) ([]store.DeadLetter, error)
 }
 
+// ModelUpgradeStore is an optional M5 extension implemented by the real
+// SQLite store. Keeping it separate preserves the small M4 test/administration
+// interface while allowing runtime compute handshakes to drive durable model
+// migration.
+type ModelUpgradeStore interface {
+	AdoptActiveEmbedModel(context.Context, string, int) (bool, error)
+	EnqueueEmbedModelUpgradeBatch(context.Context, string, int, int) (store.EmbedModelUpgradeResult, error)
+}
+
 type Config struct {
 	Retention                  time.Duration
 	SweepInterval              time.Duration
@@ -58,6 +68,8 @@ type Config struct {
 	RedrivePriority            int
 	CurrentExtractorVersion    string
 	CurrentEmbedModelVersion   string
+	ModelUpgradeInterval       time.Duration
+	ModelUpgradeBatchSize      int
 	Now                        func() time.Time
 	Notify                     func()
 	DeadLettersSize            Gauge
@@ -66,12 +78,19 @@ type Config struct {
 }
 
 type Manager struct {
-	store           Store
-	auditor         Auditor
-	config          Config
-	projectionStore ProjectionStore
-	gaugeMu         sync.Mutex
-	flushMu         sync.Mutex
+	store            Store
+	auditor          Auditor
+	config           Config
+	projectionStore  ProjectionStore
+	modelStore       ModelUpgradeStore
+	gaugeMu          sync.Mutex
+	flushMu          sync.Mutex
+	maintenanceMu    sync.Mutex
+	modelMu          sync.RWMutex
+	currentModel     string
+	currentModelDims int
+	upgradeActive    bool
+	modelWake        chan struct{}
 }
 
 func New(durable Store, auditor Auditor, config Config) (*Manager, error) {
@@ -93,11 +112,17 @@ func New(durable Store, auditor Auditor, config Config) (*Manager, error) {
 	if config.AuditFlushTimeout == 0 {
 		config.AuditFlushTimeout = DefaultAuditFlushTimeout
 	}
+	if config.ModelUpgradeInterval == 0 {
+		config.ModelUpgradeInterval = DefaultModelUpgradeTick
+	}
+	if config.ModelUpgradeBatchSize == 0 {
+		config.ModelUpgradeBatchSize = DefaultBatchSize
+	}
 	if config.Retention < 0 || config.SweepInterval < 0 || config.BatchSize < 0 || config.RedrivePriority < 0 {
 		return nil, errors.New("reliability: durations, batch size, and priority must be positive")
 	}
-	if config.AuditFlushTimeout < 0 {
-		return nil, errors.New("reliability: audit flush timeout must be positive")
+	if config.AuditFlushTimeout < 0 || config.ModelUpgradeInterval < 0 || config.ModelUpgradeBatchSize < 0 {
+		return nil, errors.New("reliability: audit/model-upgrade settings must be positive")
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -110,7 +135,17 @@ func New(durable Store, auditor Auditor, config Config) (*Manager, error) {
 			return nil, errors.New("reliability: projection store is required when failed-file projection is configured")
 		}
 	}
-	return &Manager{store: durable, auditor: auditor, config: config, projectionStore: projectionStore}, nil
+	return &Manager{
+		store: durable, auditor: auditor, config: config, projectionStore: projectionStore,
+		modelStore:   durableModelUpgradeStore(durable),
+		currentModel: strings.TrimSpace(config.CurrentEmbedModelVersion),
+		modelWake:    make(chan struct{}, 1),
+	}, nil
+}
+
+func durableModelUpgradeStore(durable Store) ModelUpgradeStore {
+	modelStore, _ := durable.(ModelUpgradeStore)
+	return modelStore
 }
 
 // Run performs startup version redrive/retention before waiting for daily
@@ -127,6 +162,8 @@ func (manager *Manager) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(manager.config.SweepInterval)
 	defer ticker.Stop()
+	upgradeTicker := time.NewTicker(manager.config.ModelUpgradeInterval)
+	defer upgradeTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -138,17 +175,37 @@ func (manager *Manager) Run(ctx context.Context) error {
 				}
 				return err
 			}
+		case <-manager.modelWake:
+			if _, err := manager.Maintain(ctx); err != nil {
+				if ctx.Err() != nil {
+					return manager.flushAfterMutation(ctx)
+				}
+				return err
+			}
+		case <-upgradeTicker.C:
+			if manager.modelUpgradeIsActive() {
+				if _, err := manager.continueModelUpgrade(ctx); err != nil {
+					if ctx.Err() != nil {
+						return manager.flushAfterMutation(ctx)
+					}
+					return err
+				}
+			}
 		}
 	}
 }
 
 type MaintenanceResult struct {
 	VersionRedriven int
+	ModelEnqueued   int
 	Archived        int
 	AuditsFlushed   int
 }
 
 func (manager *Manager) Maintain(ctx context.Context) (MaintenanceResult, error) {
+	manager.maintenanceMu.Lock()
+	defer manager.maintenanceMu.Unlock()
+
 	var result MaintenanceResult
 	flushed, err := manager.FlushAuditOutbox(ctx)
 	if err != nil {
@@ -158,13 +215,18 @@ func (manager *Manager) Maintain(ctx context.Context) (MaintenanceResult, error)
 	redriven, err := manager.RedriveVersions(
 		ctx,
 		manager.config.CurrentExtractorVersion,
-		manager.config.CurrentEmbedModelVersion,
+		manager.CurrentEmbedModelVersion(),
 		store.AuditSourceVersionMismatch,
 	)
 	if err != nil {
 		return result, err
 	}
 	result.VersionRedriven = len(redriven)
+	upgraded, err := manager.continueModelUpgrade(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.ModelEnqueued = upgraded.Enqueued
 	if err := manager.ensureAllDeadLetterProjections(ctx); err != nil {
 		return result, err
 	}
@@ -176,6 +238,112 @@ func (manager *Manager) Maintain(ctx context.Context) (MaintenanceResult, error)
 		return result, err
 	}
 	return result, nil
+}
+
+// CurrentEmbedModelVersion is the concurrency-safe runtime model source for
+// worker dead-letter provenance and version-triggered redrive. It changes only
+// after the observed version and at least one bounded migration step are both
+// durable.
+func (manager *Manager) CurrentEmbedModelVersion() string {
+	if manager == nil {
+		return ""
+	}
+	manager.modelMu.RLock()
+	defer manager.modelMu.RUnlock()
+	return manager.currentModel
+}
+
+// ObserveEmbedModel adopts a fully validated successful EmbedService response.
+// A changed version is persisted and one bounded image batch is durably
+// generation-fenced before this method returns, so callers must not expose the
+// response vectors when it fails. The lifecycle loop handles dead-letter
+// redrive and subsequent batches; identical responses do no catalog query.
+func (manager *Manager) ObserveEmbedModel(ctx context.Context, modelVersion string, dims int) error {
+	if manager == nil {
+		return errors.New("reliability: manager is required")
+	}
+	if ctx == nil {
+		return errors.New("reliability: context is required")
+	}
+	trimmedVersion := strings.TrimSpace(modelVersion)
+	if trimmedVersion == "" || trimmedVersion != modelVersion {
+		return errors.New("reliability: observed embed model version is invalid")
+	}
+	if dims <= 0 {
+		return errors.New("reliability: observed embed model dimensions must be positive")
+	}
+	if manager.modelStore == nil {
+		return errors.New("reliability: durable model-upgrade store is unavailable")
+	}
+
+	manager.modelMu.Lock()
+	if manager.currentModel == modelVersion && manager.currentModelDims == dims {
+		manager.modelMu.Unlock()
+		return nil
+	}
+	previousModel := manager.currentModel
+	if _, err := manager.modelStore.AdoptActiveEmbedModel(ctx, modelVersion, dims); err != nil {
+		manager.modelMu.Unlock()
+		return fmt.Errorf("reliability: persist observed embed model %q/%d: %w", modelVersion, dims, err)
+	}
+	if previousModel == modelVersion {
+		manager.currentModelDims = dims
+		manager.modelMu.Unlock()
+		return nil
+	}
+	upgrade, err := manager.modelStore.EnqueueEmbedModelUpgradeBatch(
+		ctx, modelVersion, manager.config.RedrivePriority, manager.config.ModelUpgradeBatchSize,
+	)
+	if err != nil {
+		manager.modelMu.Unlock()
+		return fmt.Errorf("reliability: enqueue observed embed model %q migration: %w", modelVersion, err)
+	}
+	manager.currentModel = modelVersion
+	manager.currentModelDims = dims
+	manager.upgradeActive = upgrade.HasMore
+	manager.modelMu.Unlock()
+	manager.notify(upgrade.Enqueued)
+	manager.signalModelMaintenance()
+	return nil
+}
+
+func (manager *Manager) continueModelUpgrade(ctx context.Context) (store.EmbedModelUpgradeResult, error) {
+	if manager.modelStore == nil {
+		return store.EmbedModelUpgradeResult{}, nil
+	}
+	manager.modelMu.RLock()
+	modelVersion := manager.currentModel
+	if modelVersion == "" {
+		manager.modelMu.RUnlock()
+		return store.EmbedModelUpgradeResult{}, nil
+	}
+	result, err := manager.modelStore.EnqueueEmbedModelUpgradeBatch(
+		ctx, modelVersion, manager.config.RedrivePriority, manager.config.ModelUpgradeBatchSize,
+	)
+	manager.modelMu.RUnlock()
+	if err != nil {
+		return result, fmt.Errorf("reliability: continue embed model %q migration: %w", modelVersion, err)
+	}
+	manager.modelMu.Lock()
+	if manager.currentModel == modelVersion {
+		manager.upgradeActive = result.HasMore
+	}
+	manager.modelMu.Unlock()
+	manager.notify(result.Enqueued)
+	return result, nil
+}
+
+func (manager *Manager) modelUpgradeIsActive() bool {
+	manager.modelMu.RLock()
+	defer manager.modelMu.RUnlock()
+	return manager.upgradeActive
+}
+
+func (manager *Manager) signalModelMaintenance() {
+	select {
+	case manager.modelWake <- struct{}{}:
+	default:
+	}
 }
 
 // Redrive selects either explicit file IDs or one error class. Store validates

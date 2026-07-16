@@ -14,6 +14,7 @@ const fileColumns = `file_id,path,size,mtime_ns,inode,sample_hash,kind,generatio
 const (
 	defaultFilePrefixPageLimit = 1000
 	maxFilePrefixPageLimit     = 10000
+	fileIDLookupBatchLimit     = 900
 )
 
 type rowScanner interface {
@@ -205,6 +206,61 @@ func (s *Store) GetFileByID(ctx context.Context, fileID int64) (File, error) {
 		return File{}, fmt.Errorf("store: get file %d: %w", fileID, err)
 	}
 	return file, nil
+}
+
+// GetFilesByIDs resolves a search candidate set without issuing one catalog
+// query per hit. Missing IDs are deliberately omitted: the search layer treats
+// an absent or concurrently deleted catalog row as an ineligible result.
+func (s *Store) GetFilesByIDs(ctx context.Context, fileIDs []int64) (map[int64]File, error) {
+	if ctx == nil {
+		return nil, errors.New("store: context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("store: get files by IDs: %w", err)
+	}
+	unique := make([]int64, 0, len(fileIDs))
+	seen := make(map[int64]struct{}, len(fileIDs))
+	for _, fileID := range fileIDs {
+		if fileID <= 0 {
+			return nil, fmt.Errorf("store: file ID %d must be positive", fileID)
+		}
+		if _, exists := seen[fileID]; exists {
+			continue
+		}
+		seen[fileID] = struct{}{}
+		unique = append(unique, fileID)
+	}
+	files := make(map[int64]File, len(unique))
+	for start := 0; start < len(unique); start += fileIDLookupBatchLimit {
+		end := min(start+fileIDLookupBatchLimit, len(unique))
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", end-start), ",")
+		arguments := make([]any, 0, end-start)
+		for _, fileID := range unique[start:end] {
+			arguments = append(arguments, fileID)
+		}
+		rows, err := s.read.QueryContext(ctx,
+			"SELECT "+fileColumns+" FROM files WHERE file_id IN ("+placeholders+")", arguments...)
+		if err != nil {
+			return nil, fmt.Errorf("store: get files by IDs: %w", err)
+		}
+		for rows.Next() {
+			file, scanErr := scanFile(rows)
+			if scanErr != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("store: scan file by ID: %w", scanErr)
+			}
+			files[file.ID] = file
+		}
+		iterationErr := rows.Err()
+		closeErr := rows.Close()
+		if iterationErr != nil {
+			return nil, fmt.Errorf("store: iterate files by IDs: %w", iterationErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("store: close files by IDs: %w", closeErr)
+		}
+	}
+	return files, nil
 }
 
 func (s *Store) ListFilesByPrefix(ctx context.Context, prefix string, limit int) ([]File, error) {
